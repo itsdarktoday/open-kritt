@@ -6,6 +6,7 @@ import { usePageChrome } from '../context/ui.jsx';
 import { CardLinkOverlay, Spinner, ErrorState, StatusBadge, Button } from '../components/ui.jsx';
 import LinkifiedText from '../components/LinkifiedText.jsx';
 import {
+  formatDuration,
   sevColor,
   findingSeverity,
   providerCapacityAutoscalePresentation,
@@ -18,14 +19,12 @@ import { configuredModelCatalog, configuredModelProviders } from '../lib/modelPr
 import { createLatestFieldMutationQueue } from '../lib/latestMutation.js';
 import { duplicateScanPath } from '../lib/scanDuplication.js';
 import { useUnsavedChangesPrompt } from '../lib/useUnsavedChangesPrompt.js';
-import WorkflowModelConfiguration, {
-  workflowModelConfigurationForCatalog,
-  workflowModelConfigurationIsValid,
-} from '../components/WorkflowModelConfiguration.jsx';
-import { modelOverridesDraft, modelOverridesEqual, reconcileModelOverrides } from '../lib/modelOverrides.js';
+import ModelConfiguration, {
+  modelConfigurationForCatalog,
+  modelConfigurationIsValid,
+} from '../components/ModelConfiguration.jsx';
 import { usePagination } from '../lib/usePagination.js';
 import Pagination from '../components/Pagination.jsx';
-import { saveBrowserDownload } from '../lib/download.js';
 
 export function scanActions(status) {
   const active = ['prewarming_cache', 'running', 'post_processing'].includes(status);
@@ -37,26 +36,6 @@ export function scanActions(status) {
     ),
     canDelete: isScanDeletable(status),
     stopLabel: ['queued', 'pending'].includes(status) ? 'Cancel' : status === 'rate_limited' ? 'Stop retrying' : 'Stop',
-  };
-}
-
-export function scanFindingExportAvailability(scan) {
-  if (!['completed', 'stopped', 'failed'].includes(scan?.status)) {
-    return {
-      ready: false,
-      message: 'Available after the scan completes, stops, or fails.',
-    };
-  }
-  if (!Number(scan?.findings)) return { ready: false, message: 'This scan has no findings to export.' };
-  if (scan.status !== 'completed') {
-    return {
-      ready: true,
-      message: `Download a partial export from this ${scan.status} scan. Some findings or post-processing artifacts may be missing.`,
-    };
-  }
-  return {
-    ready: true,
-    message: 'Download a share-safe index and untrusted finding, report, PoC, and post-processing content.',
   };
 }
 
@@ -81,7 +60,6 @@ export default function ScanDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
-  const [exporting, setExporting] = useState(false);
   const [actionError, setActionError] = useState(null);
   const [extrasOpen, setExtrasOpen] = useState(false);
   const [reviewError, setReviewError] = useState(null);
@@ -157,19 +135,6 @@ export default function ScanDetail() {
     }
   };
 
-  const exportFindings = async () => {
-    if (exporting) return;
-    setExporting(true);
-    setActionError(null);
-    try {
-      saveBrowserDownload(await api.exportScanFindings(id));
-    } catch (exportError) {
-      setActionError(exportError);
-    } finally {
-      setExporting(false);
-    }
-  };
-
   // Optimistically update review fields. Per-record queues ensure rapid clicks
   // reach the server in order, and pending overlays survive background polls.
   const saveVuln = (vuln, patch) => {
@@ -229,7 +194,6 @@ export default function ScanDetail() {
   const list = vulns || [];
   const extraEntries = scan.extra && typeof scan.extra === 'object' ? Object.entries(scan.extra) : [];
   const actions = scanActions(scan.status);
-  const exportAvailability = scanFindingExportAvailability(scan);
   const agentSkills =
     Array.isArray(scan.agentSkills) && scan.agentSkills.length
       ? scan.agentSkills
@@ -262,12 +226,10 @@ export default function ScanDetail() {
         }}
       >
         <div
-          className="scan-detail-heading"
           style={{
             display: 'flex',
             alignItems: 'flex-start',
             justifyContent: 'space-between',
-            gap: 16,
           }}
         >
           <div>
@@ -292,23 +254,11 @@ export default function ScanDetail() {
             <div className="mono" style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 7 }}>
               {scan.workflowName} · {scan.modelProvider ? `${scan.modelProvider} · ` : ''}
               {scan.model} · {scan.harness}
-              {scan.thinkingEffort ? ` · ${scan.thinkingEffort}` : ''}
-              {Object.keys(scan.modelOverrides || {}).length
-                ? ` · ${Object.keys(scan.modelOverrides).length} depth overrides`
-                : ''}{' '}
-              · {scan.repoKind === 'local' ? 'local snapshot' : `@${scan.commitShort}`}
+              {scan.thinkingEffort ? ` · ${scan.thinkingEffort}` : ''} ·{' '}
+              {scan.repoKind === 'local' ? 'local snapshot' : `@${scan.commitShort}`}
             </div>
           </div>
-          <div className="scan-detail-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            <Button
-              variant="subtle"
-              style={{ height: 32 }}
-              onClick={exportFindings}
-              disabled={!exportAvailability.ready || busy || exporting}
-              title={exportAvailability.message}
-            >
-              {exporting ? 'Exporting…' : 'Export findings'}
-            </Button>
+          <div style={{ display: 'flex', gap: 8 }}>
             <Button
               variant="ghost"
               style={{ height: 32 }}
@@ -318,12 +268,7 @@ export default function ScanDetail() {
               Duplicate scan
             </Button>
             {actions.canDelete && (
-              <Button
-                variant="danger"
-                style={{ height: 32 }}
-                onClick={() => !busy && !exporting && deleteScan()}
-                disabled={busy || exporting}
-              >
+              <Button variant="danger" style={{ height: 32 }} onClick={() => !busy && deleteScan()} disabled={busy}>
                 Delete
               </Button>
             )}
@@ -406,6 +351,20 @@ export default function ScanDetail() {
               <strong>{rateLimit.label}.</strong>
             )}{' '}
             {rateLimit.message} {rateLimitRetryText(scan.reasoning)} Completed work is preserved.
+            {scan.statusSummary?.retryState && (
+              <div className="mono" style={{ marginTop: 6 }}>
+                Retry state:
+                {scan.statusSummary.retryState.retryStrategy
+                  ? ` ${scan.statusSummary.retryState.retryStrategy.replaceAll('_', ' ')}`
+                  : ' waiting'}
+                {Number.isFinite(scan.statusSummary.retryState.etaSeconds)
+                  ? `, ETA ${formatDuration(scan.statusSummary.retryState.etaSeconds)}`
+                  : ''}
+                {Number.isFinite(scan.statusSummary.retryState.backoffSeconds)
+                  ? `, backoff ${formatDuration(scan.statusSummary.retryState.backoffSeconds)}`
+                  : ''}
+              </div>
+            )}
             {rateLimit.accountRelated && (
               <div style={{ marginTop: 6 }}>
                 <Link to="/accounts" style={{ color: 'inherit', fontWeight: 600 }}>
@@ -909,30 +868,21 @@ function ScanRunSettings({
   const activeDraft = mergeRunSettingsDraft(current, draft);
   const payload = draft ? runSettingsPayload(draft, current) : {};
   const dirty = Object.keys(payload).length > 0;
-  const workflowDepths = Array.isArray(scan.workflowDepths)
-    ? scan.workflowDepths
-    : Object.keys(current.model_overrides).map(Number);
   const jobLimit = activeDraft.job_limit.trim();
   const jobLimitValid = !jobLimit || (/^\d+$/.test(jobLimit) && Number(jobLimit) >= 1 && Number(jobLimit) <= 1_000_000);
   const valid =
-    jobLimitValid &&
-    !!references &&
-    workflowModelConfigurationIsValid(activeDraft, workflowDepths, references.providers, references.catalog);
+    jobLimitValid && !!references && modelConfigurationIsValid(activeDraft, references.providers, references.catalog);
   useUnsavedChangesPrompt(editing && (dirty || saving));
 
   const open = () => {
     const currentDraft = runSettingsDraft(scan);
-    const reconciledDraft = {
-      ...currentDraft,
-      model_overrides: reconcileModelOverrides(currentDraft.model_overrides, workflowDepths, currentDraft),
-    };
     setDraft(
       references
         ? mergeRunSettingsDraft(
-            reconciledDraft,
-            workflowModelConfigurationForCatalog(reconciledDraft, references.providers, references.catalog)
+            currentDraft,
+            modelConfigurationForCatalog(currentDraft, references.providers, references.catalog)
           )
-        : reconciledDraft
+        : currentDraft
     );
     setError(null);
     setEditing(true);
@@ -1040,7 +990,7 @@ function ScanRunSettings({
 
       {editing ? (
         <>
-          <WorkflowModelConfiguration
+          <ModelConfiguration
             value={activeDraft}
             onChange={(nextDraft) =>
               setDraft((currentDraft) => mergeRunSettingsDraft(currentDraft || current, nextDraft))
@@ -1049,7 +999,6 @@ function ScanRunSettings({
             catalog={references?.catalog || {}}
             catalogError={catalogError}
             disabled={saving}
-            depths={workflowDepths}
           />
           <label style={{ display: 'block', maxWidth: 280, marginTop: 13 }}>
             <span
@@ -1123,11 +1072,6 @@ function ScanRunSettings({
           <RuntimeSetting label="model_provider" value={current.model_provider || '—'} />
           <RuntimeSetting label="thinking_effort" value={current.thinking_effort || '—'} />
           <RuntimeSetting label="harness" value={current.harness} />
-          <RuntimeSetting label="post model" value={current.post_processing_model || '—'} />
-          <RuntimeSetting label="post provider" value={current.post_processing_model_provider || '—'} />
-          <RuntimeSetting label="post effort" value={current.post_processing_thinking_effort || '—'} />
-          <RuntimeSetting label="post harness" value={current.post_processing_harness || '—'} />
-          <RuntimeSetting label="depth overrides" value={Object.keys(current.model_overrides).length || 'none'} />
           <RuntimeSetting
             label="model jobs"
             value={`${scan.jobsStarted || 0} / ${scan.jobLimit == null ? 'unlimited' : scan.jobLimit}`}
@@ -1143,13 +1087,7 @@ export function runSettingsDraft(scan = {}) {
     model: scan.model || '',
     model_provider: scan.modelProvider || 'openrouter',
     thinking_effort: scan.thinkingEffort || 'medium',
-    post_processing_model_override: Boolean(scan.postProcessingModelOverride),
-    post_processing_model: scan.postProcessingModel || scan.model || '',
-    post_processing_model_provider: scan.postProcessingModelProvider || scan.modelProvider || 'openrouter',
-    post_processing_harness: scan.postProcessingHarness || scan.harness || 'codex',
-    post_processing_thinking_effort: scan.postProcessingThinkingEffort || scan.thinkingEffort || 'medium',
     harness: scan.harness || 'codex',
-    model_overrides: modelOverridesDraft(scan.modelOverrides),
     job_limit: scan.jobLimit == null ? '' : `${scan.jobLimit}`,
   };
 }
@@ -1161,49 +1099,18 @@ function runSettingsValue(value, fallback) {
 }
 
 export function mergeRunSettingsDraft(current = {}, patch = {}) {
-  const hasModelOverrides = Object.prototype.hasOwnProperty.call(patch || {}, 'model_overrides');
-  const hasPostProcessingModelOverride = Object.prototype.hasOwnProperty.call(
-    patch || {},
-    'post_processing_model_override'
-  );
   const base = {
     model: runSettingsValue(current?.model, ''),
     model_provider: runSettingsValue(current?.model_provider, 'openrouter'),
     thinking_effort: runSettingsValue(current?.thinking_effort, 'medium'),
-    post_processing_model_override: Boolean(current?.post_processing_model_override),
-    post_processing_model: runSettingsValue(current?.post_processing_model, current?.model || ''),
-    post_processing_model_provider: runSettingsValue(
-      current?.post_processing_model_provider,
-      current?.model_provider || 'openrouter'
-    ),
-    post_processing_harness: runSettingsValue(current?.post_processing_harness, current?.harness || 'codex'),
-    post_processing_thinking_effort: runSettingsValue(
-      current?.post_processing_thinking_effort,
-      current?.thinking_effort || 'medium'
-    ),
     harness: runSettingsValue(current?.harness, 'codex'),
-    model_overrides: modelOverridesDraft(current?.model_overrides),
     job_limit: runSettingsValue(current?.job_limit, ''),
   };
   return {
     model: runSettingsValue(patch?.model, base.model),
     model_provider: runSettingsValue(patch?.model_provider, base.model_provider),
     thinking_effort: runSettingsValue(patch?.thinking_effort, base.thinking_effort),
-    post_processing_model_override: hasPostProcessingModelOverride
-      ? Boolean(patch.post_processing_model_override)
-      : base.post_processing_model_override,
-    post_processing_model: runSettingsValue(patch?.post_processing_model, base.post_processing_model),
-    post_processing_model_provider: runSettingsValue(
-      patch?.post_processing_model_provider,
-      base.post_processing_model_provider
-    ),
-    post_processing_harness: runSettingsValue(patch?.post_processing_harness, base.post_processing_harness),
-    post_processing_thinking_effort: runSettingsValue(
-      patch?.post_processing_thinking_effort,
-      base.post_processing_thinking_effort
-    ),
     harness: runSettingsValue(patch?.harness, base.harness),
-    model_overrides: hasModelOverrides ? modelOverridesDraft(patch.model_overrides) : base.model_overrides,
     job_limit: runSettingsValue(patch?.job_limit, base.job_limit),
   };
 }
@@ -1219,26 +1126,7 @@ export function runSettingsPayload(draft, current) {
     payload.model_provider = normalizedDraft.model_provider;
   if (normalizedDraft.thinking_effort !== normalizedCurrent.thinking_effort)
     payload.thinking_effort = normalizedDraft.thinking_effort;
-  const postProcessingModelChanged =
-    normalizedDraft.post_processing_model !== normalizedCurrent.post_processing_model ||
-    normalizedDraft.post_processing_model_provider !== normalizedCurrent.post_processing_model_provider ||
-    normalizedDraft.post_processing_harness !== normalizedCurrent.post_processing_harness;
-  if (normalizedDraft.post_processing_model_override) {
-    if (!normalizedCurrent.post_processing_model_override || postProcessingModelChanged) {
-      payload.post_processing_model = normalizedDraft.post_processing_model.trim();
-      payload.post_processing_model_provider = normalizedDraft.post_processing_model_provider;
-      payload.post_processing_harness = normalizedDraft.post_processing_harness;
-    }
-  } else if (normalizedCurrent.post_processing_model_override) {
-    payload.post_processing_model = null;
-    payload.post_processing_model_provider = null;
-    payload.post_processing_harness = null;
-  }
-  if (normalizedDraft.post_processing_thinking_effort !== normalizedCurrent.post_processing_thinking_effort)
-    payload.post_processing_thinking_effort = normalizedDraft.post_processing_thinking_effort;
   if (normalizedDraft.harness !== normalizedCurrent.harness) payload.harness = normalizedDraft.harness;
-  if (!modelOverridesEqual(normalizedDraft.model_overrides, normalizedCurrent.model_overrides))
-    payload.model_overrides = normalizedDraft.model_overrides;
   if (normalizedDraft.job_limit !== normalizedCurrent.job_limit) payload.jobLimit = jobLimit ? Number(jobLimit) : null;
   return payload;
 }
@@ -1298,264 +1186,13 @@ function scanErrorTimestamp(error) {
   return null;
 }
 
-const EXTENDED_ACTIVE_JOB_MS = 45 * 60 * 1000;
-const ACTIVE_JOB_DEPTH_PALETTE_SIZE = 6;
-const ACTIVE_JOB_HARNESS_LABELS = Object.freeze({
-  codex: 'Codex CLI',
-  'claude-code': 'Claude Code',
-  droid: 'Factory Droid',
-});
-
-function activeJobHarnessLabel(value) {
-  const harness = `${value || ''}`.trim();
-  return ACTIVE_JOB_HARNESS_LABELS[harness] || harness || 'Not reported';
-}
-
-export function activeJobWorkflowDepth(job) {
-  if (job?.kind && job.kind !== 'step') return null;
-  if (job?.depth != null && job.depth !== '') {
-    const explicitDepth = Number(job.depth);
-    if (Number.isInteger(explicitDepth) && explicitDepth >= 0) return explicitDepth;
-  }
-  const titleMatch = `${job?.title || ''}`.match(/^\s*(\d+)\s*·/);
-  if (!titleMatch) return null;
-  const titleDepth = Number(titleMatch[1]);
-  return Number.isInteger(titleDepth) ? titleDepth : null;
-}
-
-function activeJobStage(job) {
-  const depth = activeJobWorkflowDepth(job);
-  if (depth != null) return { key: `depth-${depth}`, label: `D${depth}`, depth };
-  if (job?.kind && job.kind !== 'step') return { key: 'post', label: 'POST', depth: null };
-  return { key: 'work', label: 'WORK', depth: null };
-}
-
-function activeJobDepthStyle(stage) {
-  if (stage.depth == null) {
-    return { color: 'var(--text-2)', background: 'var(--surface)' };
-  }
-  const paletteIndex = stage.depth % ACTIVE_JOB_DEPTH_PALETTE_SIZE;
-  return {
-    color: `var(--depth-${paletteIndex})`,
-    background: `var(--depth-${paletteIndex}-bg)`,
-  };
-}
-
-export function activeJobDepthSummary(jobs = []) {
-  const counts = new Map();
-  for (const job of jobs) {
-    const stage = activeJobStage(job);
-    const current = counts.get(stage.key);
-    if (current) current.count += 1;
-    else counts.set(stage.key, { ...stage, count: 1 });
-  }
-  return [...counts.values()].sort((left, right) => {
-    if (left.depth != null && right.depth != null) return left.depth - right.depth;
-    if (left.depth != null) return -1;
-    if (right.depth != null) return 1;
-    return left.label.localeCompare(right.label);
-  });
-}
-
-export function formatActiveJobElapsed(value) {
-  const milliseconds = Number(value);
-  if (!Number.isFinite(milliseconds) || milliseconds < 0) return null;
-  const seconds = Math.floor(milliseconds / 1000);
-  if (seconds < 1) return '<1s';
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
-}
-
-function ActiveJobCard({ job }) {
-  const elapsed = formatActiveJobElapsed(job.elapsedMs);
-  const extended = Number(job.elapsedMs) >= EXTENDED_ACTIVE_JOB_MS;
-  const stage = activeJobStage(job);
-  const depthStyle = activeJobDepthStyle(stage);
-  const model = `${job.model || ''}`.trim() || 'Not reported';
-  const harness = activeJobHarnessLabel(job.harness);
-
-  return (
-    <article
-      aria-label={`${stage.depth == null ? stage.label : `Workflow depth ${stage.depth}`} worker: ${job.title || job.source || 'Active worker'}`}
-      style={{
-        minWidth: 0,
-        border: `1px solid ${extended ? 'var(--pend)' : 'var(--border)'}`,
-        borderRadius: 9,
-        background: `linear-gradient(135deg, ${depthStyle.background} 0%, var(--surface-2) 48%)`,
-        padding: '10px 11px',
-      }}
-    >
-      <div
-        className="mono"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 10,
-          fontSize: 10.5,
-        }}
-      >
-        <span
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 7,
-            minWidth: 0,
-            color: 'var(--run)',
-          }}
-        >
-          <span
-            title={stage.depth == null ? stage.label : `Workflow depth ${stage.depth}`}
-            style={{
-              flex: '0 0 auto',
-              border: `1px solid color-mix(in srgb, ${depthStyle.color} 32%, var(--border))`,
-              borderRadius: 5,
-              background: depthStyle.background,
-              color: depthStyle.color,
-              fontSize: 9.5,
-              fontWeight: 700,
-              letterSpacing: '0.04em',
-              lineHeight: 1,
-              padding: '4px 5px 3px',
-            }}
-          >
-            {stage.label}
-          </span>
-          <span
-            aria-hidden="true"
-            style={{
-              width: 6,
-              height: 6,
-              flex: '0 0 auto',
-              borderRadius: '50%',
-              background: 'var(--run)',
-            }}
-          />
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {job.phaseLabel || 'Running'}
-          </span>
-        </span>
-        <span
-          title={
-            extended
-              ? 'Extended run. This is informational and does not mean the worker is stuck or failed.'
-              : 'Current active harness duration'
-          }
-          style={{ flex: '0 0 auto', color: extended ? 'var(--pend)' : 'var(--text-2)' }}
-        >
-          {extended ? 'extended · ' : ''}
-          {elapsed || 'starting'}
-        </span>
-      </div>
-
-      <div
-        title={job.title}
-        style={{
-          color: 'var(--text)',
-          fontSize: 12.5,
-          fontWeight: 600,
-          lineHeight: 1.35,
-          marginTop: 8,
-          overflowWrap: 'anywhere',
-          whiteSpace: 'normal',
-        }}
-      >
-        {job.title || job.source || 'Active worker'}
-      </div>
-
-      <div
-        className="mono"
-        aria-label={`Model: ${model}; Harness: ${harness}`}
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'minmax(0, 1fr) auto',
-          alignItems: 'end',
-          gap: 10,
-          borderTop: '1px solid var(--border)',
-          marginTop: 9,
-          paddingTop: 8,
-        }}
-      >
-        <div style={{ minWidth: 0 }}>
-          <div
-            style={{
-              color: 'var(--text-3)',
-              fontSize: 8.5,
-              letterSpacing: '0.08em',
-              lineHeight: 1,
-              textTransform: 'uppercase',
-            }}
-          >
-            Model
-          </div>
-          <div
-            title={`Model: ${model}`}
-            style={{
-              color: 'var(--text)',
-              fontSize: 11.5,
-              fontWeight: 650,
-              lineHeight: 1.25,
-              marginTop: 5,
-              overflowWrap: 'anywhere',
-            }}
-          >
-            {model}
-          </div>
-        </div>
-        <div style={{ minWidth: 0, textAlign: 'right' }}>
-          <div
-            style={{
-              color: 'var(--text-3)',
-              fontSize: 8.5,
-              letterSpacing: '0.08em',
-              lineHeight: 1,
-              textTransform: 'uppercase',
-            }}
-          >
-            Harness
-          </div>
-          <span
-            title={`Harness: ${harness}`}
-            style={{
-              display: 'inline-block',
-              maxWidth: 120,
-              border: '1px solid var(--border-2)',
-              borderRadius: 999,
-              background: 'var(--surface)',
-              color: 'var(--text-2)',
-              fontSize: 9.5,
-              lineHeight: 1,
-              marginTop: 4,
-              overflow: 'hidden',
-              padding: '4px 6px',
-              textOverflow: 'ellipsis',
-              verticalAlign: 'bottom',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {harness}
-          </span>
-        </div>
-      </div>
-    </article>
-  );
-}
-
 export function ScanStatusPanel({ scan }) {
   const summary = scan.statusSummary || {};
   const rateLimited = scan.status === 'rate_limited';
+  const retryState = summary.retryState || null;
   const completedLineages = summary.completedStepLineages ?? summary.stepCompletedAttempts ?? 0;
   const expectedLineages = summary.expectedStepLineages ?? summary.stepAttempts ?? 0;
   const activeJobs = summary.activeJobs || [];
-  const activeDepths = activeJobDepthSummary(activeJobs);
-  const longestActiveJobMs = activeJobs.reduce((longest, job) => {
-    const elapsed = Number(job?.elapsedMs);
-    return Number.isFinite(elapsed) ? Math.max(longest, elapsed) : longest;
-  }, 0);
   const recentErrors = summary.recentErrors || [];
   const currentFailedAttempts = summary.currentFailedAttempts ?? summary.failedAttempts ?? 0;
   const [expandedErrorIds, setExpandedErrorIds] = useState(() => new Set());
@@ -1611,7 +1248,7 @@ export function ScanStatusPanel({ scan }) {
             <RuntimeMetric label="Post" value={`${summary.postCompletedAttempts || 0}/${summary.postAttempts || 0}`} />
           </div>
         </div>
-        {summary.progress && (
+        {(summary.progress || retryState) && (
           <div style={{ minWidth: 160, flex: '0 0 220px' }}>
             <div
               className="mono"
@@ -1623,98 +1260,71 @@ export function ScanStatusPanel({ scan }) {
             >
               {summary.progressLabel || 'progress'}
             </div>
-            <div
-              style={{
-                height: 6,
-                background: 'var(--surface-2)',
-                borderRadius: 4,
-                overflow: 'hidden',
-              }}
-            >
+            {summary.progress && (
               <div
                 style={{
-                  height: '100%',
-                  width: summary.progress,
-                  background: 'var(--run)',
+                  height: 6,
+                  background: 'var(--surface-2)',
+                  borderRadius: 4,
+                  overflow: 'hidden',
                 }}
-              />
-            </div>
+              >
+                <div
+                  style={{
+                    height: '100%',
+                    width: summary.progress,
+                    background: 'var(--run)',
+                  }}
+                />
+              </div>
+            )}
+            {retryState && (
+              <div className="mono" style={{ marginTop: 8, fontSize: 11.5, color: 'var(--text-2)', lineHeight: 1.45 }}>
+                <div>
+                  Strategy: {(retryState.retryStrategy || 'automatic_retry').replaceAll('_', ' ')}
+                  {retryState.limitKind ? ` · ${String(retryState.limitKind).replaceAll('_', ' ')}` : ''}
+                </div>
+                {Number.isFinite(retryState.etaSeconds) && <div>ETA: {formatDuration(retryState.etaSeconds)}</div>}
+                {Number.isFinite(retryState.backoffSeconds) && (
+                  <div>Backoff: {formatDuration(retryState.backoffSeconds)}</div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
 
       {activeJobs.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <div
-            className="mono"
-            style={{
-              display: 'flex',
-              alignItems: 'baseline',
-              justifyContent: 'space-between',
-              flexWrap: 'wrap',
-              gap: 8,
-              marginBottom: 8,
-            }}
-          >
-            <span style={{ color: 'var(--text-2)', fontSize: 11.5 }}>Active workers</span>
-            <span style={{ color: 'var(--text-3)', fontSize: 10.5 }}>
-              {activeJobs.length} active
-              {longestActiveJobMs > 0 ? ` · longest ${formatActiveJobElapsed(longestActiveJobMs)}` : ''}
+        <div style={{ marginTop: 14, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {activeJobs.map((job) => (
+            <span
+              key={job.id}
+              className="mono"
+              style={{
+                display: 'inline-flex',
+                gap: 6,
+                alignItems: 'center',
+                maxWidth: '100%',
+                padding: '4px 8px',
+                borderRadius: 7,
+                background: 'var(--run-bg)',
+                color: 'var(--run)',
+                fontSize: 11.5,
+              }}
+            >
+              <span>{job.phaseLabel}</span>
+              <span
+                style={{
+                  color: 'var(--text-2)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {job.title}
+              </span>
             </span>
-          </div>
-          <div
-            aria-label="Active workers by workflow depth"
-            className="mono"
-            style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 9 }}
-          >
-            {activeDepths.map((stage) => {
-              const depthStyle = activeJobDepthStyle(stage);
-              const description =
-                stage.depth == null
-                  ? `${stage.label}: ${stage.count} active worker${stage.count === 1 ? '' : 's'}`
-                  : `Depth ${stage.depth}: ${stage.count} active worker${stage.count === 1 ? '' : 's'}`;
-              return (
-                <span
-                  key={stage.key}
-                  title={description}
-                  aria-label={description}
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 5,
-                    border: `1px solid color-mix(in srgb, ${depthStyle.color} 30%, var(--border))`,
-                    borderRadius: 999,
-                    background: depthStyle.background,
-                    color: depthStyle.color,
-                    fontSize: 10,
-                    lineHeight: 1,
-                    padding: '5px 7px',
-                  }}
-                >
-                  <span
-                    aria-hidden="true"
-                    style={{ width: 6, height: 6, borderRadius: '50%', background: depthStyle.color }}
-                  />
-                  <strong style={{ fontWeight: 700 }}>{stage.label}</strong>
-                  <span>{stage.count}</span>
-                </span>
-              );
-            })}
-          </div>
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))',
-              gap: 8,
-            }}
-          >
-            {activeJobs.map((job) => (
-              <ActiveJobCard key={job.id} job={job} />
-            ))}
-          </div>
-          <div className="mono" style={{ color: 'var(--text-3)', fontSize: 9.5, marginTop: 7 }}>
-            Live duration is informational. The engine reports failures separately below.
-          </div>
+          ))}
         </div>
       )}
 

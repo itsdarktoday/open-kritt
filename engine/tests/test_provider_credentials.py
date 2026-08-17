@@ -2,6 +2,7 @@ import json
 
 from open_kritt_engine.provider_credentials import (
     bootstrap_managed_provider_credentials,
+    custom_provider_settings,
     job_environment,
     provider_environment,
     read_managed_provider_credentials,
@@ -127,3 +128,47 @@ def test_job_environment_only_includes_selected_provider_and_harness_credentials
     for env in (codex, openrouter_claude, openrouter_cursor):
         assert "DATABASE_URL" not in env
         assert "GITHUB_TOKEN" not in env
+
+
+def test_job_environment_includes_custom_provider_credentials_for_openai_compatible_harness(tmp_path):
+    credential_path = tmp_path / "providers.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "credentials": {},
+                "customProviders": [
+                    {
+                        "id": "custom-gateway",
+                        "label": "Custom Gateway",
+                        "baseUrl": "https://provider.example/v1/",
+                        "apiKey": "gateway-secret",
+                        "model": "gateway-model",
+                        "organization": "org_123",
+                        "extraHeaders": {"X-Test": "yes"},
+                    }
+                ],
+                "disabledEnvironmentProviders": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    env = job_environment(
+        "custom-gateway",
+        "openai-compatible",
+        {
+            "OPEN_KRITT_PROVIDER_CREDENTIALS_PATH": str(credential_path),
+            "PATH": "/bin",
+            "DATABASE_URL": "hidden",
+        },
+    )
+
+    assert env["PATH"] == "/bin"
+    assert env["OPENAI_API_KEY"] == "gateway-secret"
+    assert env["OPEN_KRITT_CUSTOM_PROVIDER_BASE_URL"] == "https://provider.example/v1/"
+    assert env["OPEN_KRITT_CUSTOM_PROVIDER_NAME"] == "Custom Gateway"
+    assert env["OPEN_KRITT_CUSTOM_PROVIDER_ORGANIZATION"] == "org_123"
+    assert json.loads(env["OPEN_KRITT_CUSTOM_PROVIDER_EXTRA_HEADERS"]) == {"X-Test": "yes"}
+    assert "DATABASE_URL" not in env
+    assert custom_provider_settings("custom-gateway", env)["model"] == "gateway-model"

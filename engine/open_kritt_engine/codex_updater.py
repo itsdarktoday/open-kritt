@@ -105,23 +105,28 @@ class CodexUpdater:
                 return CodexUpdateResult(True, False, False, before_version, None)
 
             after_version = self._version()
-            if not after_version:
-                LOGGER.warning("Codex CLI update completed but the installed CLI could not start")
-                return CodexUpdateResult(True, False, False, before_version, None)
-
             updated = before_version != after_version
-            if updated:
+            if updated and after_version:
                 LOGGER.info("updated Codex CLI from %s to %s", before_version or "unknown", after_version)
-            else:
+            elif after_version:
                 LOGGER.info("Codex CLI is already up to date (%s)", after_version)
+            else:
+                LOGGER.warning("Codex CLI update completed but its installed version could not be read")
             return CodexUpdateResult(True, True, updated, before_version, after_version)
         finally:
             self.gate.end_update()
 
     def _version(self) -> str | None:
+        executable = "codex"
+        try:
+            from .llm.runtime.cli import CodexRuntime
+
+            executable = CodexRuntime().detect_executable() or executable
+        except Exception:
+            pass
         try:
             completed = self._run_command(
-                ["codex", "--version"],
+                [executable, "--version"],
                 capture_output=True,
                 check=False,
                 text=True,

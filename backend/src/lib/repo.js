@@ -7,7 +7,6 @@ import { isDefaultWorkflowName } from './defaultWorkflows.js';
 
 const PHASE_LABELS = {
   building_workspace: 'Building workspace',
-  checking_duplicates: 'Checking duplicates',
   running_harness: 'Running harness',
   writing_db: 'Writing to DB',
   completed: 'Completed',
@@ -204,7 +203,7 @@ export function summarizeExpectedWorkflowLineages(scan, steps, metadata, results
   const depths = [...new Set(steps.map((step) => step.depth))].sort((a, b) => a - b);
   const byDepth = new Map(depths.map((depth) => [depth, steps.filter((step) => step.depth === depth)]));
   const runs = Array.from({ length: repeatRuns(scan) }, (_, index) => index + 1);
-  let states = [{ prevId: 0, prevTable: null, sourceStepId: null }];
+  let states = [{ prevId: 0, prevTable: null }];
   let previousDepthComplete = true;
   const expected = new Set();
 
@@ -215,14 +214,11 @@ export function summarizeExpectedWorkflowLineages(scan, steps, metadata, results
     let depthComplete = previousDepthComplete;
     let inputStates = states;
     if (consumesAll) {
-      inputStates = previousDepthComplete && states.length ? [{ prevId: 0, prevTable: null, sourceStepId: null }] : [];
+      inputStates = previousDepthComplete && states.length ? [{ prevId: 0, prevTable: null }] : [];
     }
 
-    for (const step of depthSteps) {
-      const routedStates = step.boundSourceStepId
-        ? inputStates.filter((state) => `${state.sourceStepId ?? ''}` === `${step.boundSourceStepId}`)
-        : inputStates;
-      for (const state of routedStates) {
+    for (const state of inputStates) {
+      for (const step of depthSteps) {
         let taskComplete = true;
         const taskResults = [];
         for (const repeatRun of runs) {
@@ -240,7 +236,6 @@ export function summarizeExpectedWorkflowLineages(scan, steps, metadata, results
           nextStates.push({
             prevId: row.id,
             prevTable: 'workflows.step_results',
-            sourceStepId: step.id,
           });
         }
       }
@@ -274,6 +269,19 @@ async function runningProgress(scan, statusSummary) {
       progressLabel: total ? `post-processing ${done} / ${total}` : 'post-processing…',
     };
   }
+  if (scan.status === 'rate_limited') {
+    const retryCount =
+      Number.isInteger(scan.reasoning?.retry_count) && scan.reasoning.retry_count > 0 ? scan.reasoning.retry_count : 0;
+    const retryAt = Date.parse(scan.reasoning?.retry_after || '');
+    const etaSecondsRaw =
+      Number.isFinite(retryAt) ? Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)) : scan.reasoning?.retry_eta_seconds;
+    const etaSeconds = Number.isFinite(etaSecondsRaw) ? Math.max(0, Number(etaSecondsRaw)) : null;
+    const label = etaSeconds == null ? 'waiting for automatic retry' : `retry #${retryCount || 1} in ${formatEta(etaSeconds)}`;
+    return {
+      progress: null,
+      progressLabel: label,
+    };
+  }
   if (scan.status !== 'running') return { progress: null, progressLabel: null };
   const expected = statusSummary?.expectedStepLineages || 0;
   const done = statusSummary?.completedStepLineages || 0;
@@ -283,6 +291,16 @@ async function runningProgress(scan, statusSummary) {
     progress: `${pct}%`,
     progressLabel: `${done} / ${expected} workflow lineages`,
   };
+}
+
+function formatEta(totalSeconds) {
+  const seconds = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return [hours ? `${hours}h` : '', hours || minutes ? `${minutes}m` : '', `${String(remainder).padStart(2, '0')}s`]
+    .filter(Boolean)
+    .join(' ');
 }
 
 function phaseLabel(phase) {
@@ -332,15 +350,6 @@ export function knownError(value) {
       title: 'Engine storage full',
       message:
         'The scanner ran out of disk space while creating a job workspace. Free local disk space, then resume the scan.',
-    };
-  }
-  if (lower.includes('cannot set path in scalar')) {
-    return {
-      key: 'storage_warning_persistence_failed',
-      title: 'Low-storage pause failed',
-      message:
-        'The engine ran low on disk space, then could not save its automatic pause warning. Free disk space, lower Minimum free storage, or enable Ignore low-storage safeguard in Settings, then resume the scan; completed work is preserved.',
-      fixLinks: [{ label: 'Open Settings', url: '/settings', internal: true }],
     };
   }
   if (
@@ -405,15 +414,6 @@ export function knownError(value) {
       preserveMessage: true,
     };
   }
-  if (lower.includes('diagnostic: subagent_limited')) {
-    return {
-      key: 'subagent_limited',
-      title: 'Subagent limit reached',
-      message:
-        "Codex reached a separate premium limit while starting a subagent. The account's normal usage quota may still be available.",
-      preserveMessage: true,
-    };
-  }
   if (lower.includes('diagnostic: account_quota_limited')) {
     return {
       key: 'account_quota_limited',
@@ -447,6 +447,30 @@ export function knownError(value) {
       preserveMessage: true,
     };
   }
+  if (lower.includes('diagnostic: schema_validation_error')) {
+    return {
+      key: 'schema_validation_error',
+      title: 'Schema validation failed',
+      message: 'The model returned JSON, but it was missing required fields or violated the required schema.',
+      preserveMessage: true,
+    };
+  }
+  if (lower.includes('diagnostic: invalid_output') || lower.includes('diagnostic: model_output_error')) {
+    return {
+      key: 'model_output_error',
+      title: 'Model output invalid',
+      message: 'The provider returned output that could not be used as a valid structured result.',
+      preserveMessage: true,
+    };
+  }
+  if (lower.includes('diagnostic: app_bug')) {
+    return {
+      key: 'app_bug',
+      title: 'Application error',
+      message: 'Open-Kritt hit an internal application error while processing this scan.',
+      preserveMessage: true,
+    };
+  }
   return null;
 }
 
@@ -457,21 +481,11 @@ export function cleanError(value) {
   return compactError(value);
 }
 
-export function activeJobElapsedMs(row = {}, phase = effectivePhase(row), now = Date.now()) {
-  const recordedRunTime = Number(row.runTimeMs);
-  if (phase === 'writing_db' && Number.isFinite(recordedRunTime) && recordedRunTime >= 0) {
-    return recordedRunTime;
-  }
-  if (phase !== 'running_harness') return null;
-
-  // updatedAt is refreshed when the metadata enters running_harness. Using
-  // runStartedAt here would include workspace preparation and make the UI
-  // report a much longer duration than the active model process.
-  const harnessStartedAt = row.updatedAt || row.runStartedAt || row.insertedAt;
-  if (!harnessStartedAt) return null;
-  const startedAt = new Date(harnessStartedAt).getTime();
-  if (!Number.isFinite(startedAt)) return null;
-  return Math.max(0, now - startedAt);
+function elapsedMsSince(value) {
+  if (!value) return null;
+  const then = new Date(value).getTime();
+  if (!Number.isFinite(then)) return null;
+  return Math.max(0, Date.now() - then);
 }
 
 export function errorIsFromPreviousRun(scan, error) {
@@ -499,59 +513,8 @@ function metadataTitle(row, stepsMap) {
   return `${step?.depth ?? '?'} · ${step?.name || `Step ${row.stepId.toString()}`}`;
 }
 
-function runtimeValue(configuration, snakeKey, camelKey = snakeKey) {
-  if (!configuration || typeof configuration !== 'object' || Array.isArray(configuration)) return null;
-  return configuration[snakeKey] || configuration[camelKey] || null;
-}
-
-export function activeJobRuntimeSelection(row = {}, step = null, scan = {}) {
-  const kind = row.kind || 'step';
-  const overrides = scan.modelOverrides;
-  const override =
-    kind === 'step' && step && overrides && typeof overrides === 'object' && !Array.isArray(overrides)
-      ? overrides[String(step.depth)]
-      : null;
-  const postProcessingEffort =
-    runtimeValue(scan.configuration, 'post_processing_thinking_effort', 'postProcessingThinkingEffort') ||
-    scan.thinkingEffort;
-  const postProcessingModel =
-    runtimeValue(scan.configuration, 'post_processing_model', 'postProcessingModel') || scan.model;
-  const postProcessingModelProvider =
-    runtimeValue(scan.configuration, 'post_processing_model_provider', 'postProcessingModelProvider') ||
-    scan.modelProvider;
-  const postProcessingHarness =
-    runtimeValue(scan.configuration, 'post_processing_harness', 'postProcessingHarness') || scan.harness;
-
-  return {
-    model: row.model || runtimeValue(override, 'model') || (kind === 'step' ? scan.model : postProcessingModel) || null,
-    modelProvider:
-      row.modelProvider ||
-      runtimeValue(override, 'model_provider', 'modelProvider') ||
-      (kind === 'step' ? scan.modelProvider : postProcessingModelProvider) ||
-      null,
-    harness:
-      row.harness ||
-      runtimeValue(override, 'harness') ||
-      (kind === 'step' ? scan.harness : postProcessingHarness) ||
-      null,
-    thinkingEffort:
-      row.thinkingEffort ||
-      runtimeValue(override, 'thinking_effort', 'thinkingEffort') ||
-      (kind === 'step' ? scan.thinkingEffort : postProcessingEffort) ||
-      null,
-  };
-}
-
-export function activeJobWorkflowDepth(row = {}, step = null) {
-  if ((row.kind || 'step') !== 'step') return null;
-  const depth = Number(step?.depth);
-  return Number.isInteger(depth) && depth >= 0 ? depth : null;
-}
-
-function metadataJob(row, stepsMap, scan) {
+function metadataJob(row, stepsMap) {
   const phase = effectivePhase(row);
-  const step = (row.kind || 'step') === 'step' ? stepsMap.get(row.stepId.toString()) : null;
-  const runtime = activeJobRuntimeSelection(row, step, scan);
   return {
     id: row.id.toString(),
     metadataId: row.id.toString(),
@@ -561,19 +524,17 @@ function metadataJob(row, stepsMap, scan) {
     status: row.status,
     phase,
     phaseLabel: phaseLabel(phase),
-    depth: activeJobWorkflowDepth(row, step),
     startedAt: row.runStartedAt || row.insertedAt,
-    elapsedMs: activeJobElapsedMs(row, phase),
+    elapsedMs: elapsedMsSince(row.runStartedAt || row.insertedAt),
     runTimeMs: row.runTimeMs == null ? null : Number(row.runTimeMs),
     codexAccountEmail: row.codexAccountEmail || null,
     codexAccountId: row.codexAccountId || null,
-    ...runtime,
   };
 }
 
-function metadataError(row, stepsMap, scan) {
+function metadataError(row, stepsMap) {
   return {
-    ...metadataJob(row, stepsMap, scan),
+    ...metadataJob(row, stepsMap),
     message: cleanError(row.error),
     knownError: knownError(row.error),
     insertedAt: row.insertedAt,
@@ -621,6 +582,7 @@ function emptyStatusSummary(scan) {
     postFailedAttempts: 0,
     activeJobCount: 0,
     activeJobs: [],
+    retryState: null,
     latestError: null,
     recentErrors: [],
   };
@@ -653,10 +615,6 @@ async function statusSummariesByScan(scans, stepsMap, workflowsById) {
         runTimeMs: true,
         codexAccountId: true,
         codexAccountEmail: true,
-        model: true,
-        modelProvider: true,
-        harness: true,
-        thinkingEffort: true,
         insertedAt: true,
         updatedAt: true,
       },
@@ -678,10 +636,6 @@ async function statusSummariesByScan(scans, stepsMap, workflowsById) {
         runTimeMs: true,
         codexAccountId: true,
         codexAccountEmail: true,
-        model: true,
-        modelProvider: true,
-        harness: true,
-        thinkingEffort: true,
         insertedAt: true,
         updatedAt: true,
       },
@@ -710,22 +664,38 @@ async function statusSummariesByScan(scans, stepsMap, workflowsById) {
   for (const row of activeRows) {
     const summary = summaries.get(row.scanId.toString());
     if (!summary) continue;
-    const scan = scansById.get(row.scanId.toString());
-    summary.activeJobs.push(metadataJob(row, stepsMap, scan));
+    summary.activeJobs.push(metadataJob(row, stepsMap));
   }
 
   for (const scan of scans) {
     const summary = summaries.get(scan.id.toString());
     const reasoningError = scanReasoningError(scan);
     if (reasoningError) summary.recentErrors.push(reasoningError);
+    if (scan.status === 'rate_limited') {
+      const retryAt = Date.parse(scan.reasoning?.retry_after || '');
+      const etaSeconds = Number.isFinite(retryAt) ? Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)) : null;
+      summary.retryState = {
+        retryCount: Number.isInteger(scan.reasoning?.retry_count) ? scan.reasoning.retry_count : 0,
+        retryStrategy: scan.reasoning?.retry_strategy || null,
+        limitKind: scan.reasoning?.limit_kind || null,
+        backoffSeconds:
+          typeof scan.reasoning?.backoff_seconds === 'number' ? Number(scan.reasoning.backoff_seconds) : null,
+        providerRetryAfterSeconds:
+          typeof scan.reasoning?.provider_retry_after_seconds === 'number'
+            ? Number(scan.reasoning.provider_retry_after_seconds)
+            : null,
+        retryAfter: scan.reasoning?.retry_after || null,
+        etaSeconds,
+      };
+    }
   }
 
   for (const row of errorRows) {
     const summary = summaries.get(row.scanId.toString());
     if (isDerivativeScanStatusError(row.error)) continue;
-    const scan = scansById.get(row.scanId.toString());
-    const error = metadataError(row, stepsMap, scan);
+    const error = metadataError(row, stepsMap);
     if (!summary || !error.message) continue;
+    const scan = scansById.get(row.scanId.toString());
     error.previousRun = errorIsFromPreviousRun(scan, error);
     if (!error.previousRun && row.status === 'failed') summary.currentFailedAttempts += 1;
     summary.recentErrors.push(error);
@@ -733,6 +703,7 @@ async function statusSummariesByScan(scans, stepsMap, workflowsById) {
 
   for (const summary of summaries.values()) {
     summary.activeJobCount = summary.activeJobs.length;
+    summary.activeJobs = summary.activeJobs.slice(0, 5);
     summary.recentErrors = orderScanErrorsForDisplay(summary.recentErrors).slice(0, 5);
     summary.latestError = summary.recentErrors.find((error) => !error.previousRun) || null;
     summary.expectedStepLineages = summary.stepAttempts;
@@ -820,8 +791,6 @@ export async function assembleScans(scans) {
   const out = [];
   for (const s of scans) {
     const wf = wfMap.get(s.workflowId.toString());
-    const workflowSteps = (wf?.stepIds || []).map((id) => stepsMap.get(id.toString())).filter(Boolean);
-    const workflowDepths = [...new Set(workflowSteps.map((step) => step.depth))].sort((left, right) => left - right);
     const ps = psMap.get(s.postScriptId.toString());
     const scanPostScripts = configuredPostScriptIds(s)
       .map((id) => psMap.get(id))
@@ -840,7 +809,6 @@ export async function assembleScans(scans) {
     out.push(
       serializeScan(s, {
         workflowName: wf?.name ?? null,
-        workflowDepths,
         postScriptName: ps?.name ?? null,
         postScripts: scanPostScripts,
         agentSkills: scanSkills,

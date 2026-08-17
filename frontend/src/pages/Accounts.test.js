@@ -8,16 +8,17 @@ import {
   ProviderSignInRequired,
   codexWeeklyUsage,
   creditUsageNote,
-  formatResetExpiryDate,
   formatResetRemaining,
   providerActionLabel,
+  providerHasActiveLogin,
+  providerPrimaryAction,
   providerReloginAccountId,
+  providerSecondaryLoginAction,
   rateLimitLabel,
   removeAccountFromOverview,
   removeProviderFromOverview,
   replaceAccountProvider,
   startCodexWeeklyUsageUntilStarted,
-  updatePendingAccounts,
 } from './Accounts.jsx';
 
 describe('expired Codex login', () => {
@@ -52,6 +53,23 @@ describe('expired Codex login', () => {
       })
     ).toBe('expired');
   });
+
+  it('treats an active Codex session as connected instead of reopening login', () => {
+    const provider = {
+      id: 'codex',
+      management: 'login',
+      configured: true,
+      accounts: [{ id: 'primary', active: true, statusKind: 'available' }],
+    };
+
+    expect(providerHasActiveLogin(provider)).toBe(true);
+    expect(providerPrimaryAction(provider)).toEqual({
+      label: 'Use Local CLI Session',
+      mode: 'local_session',
+      disabled: false,
+    });
+    expect(providerSecondaryLoginAction(provider)).toBeNull();
+  });
 });
 
 describe('Claude usage bars', () => {
@@ -77,42 +95,6 @@ describe('Claude usage bars', () => {
     expect(html).toContain('aria-valuenow="47"');
     expect(html).toContain('aria-valuenow="9"');
   });
-
-  it('does not call usage unavailable when an unused window has no reset time yet', () => {
-    const html = renderToStaticMarkup(
-      createElement(AccountRateLimits, {
-        providerId: 'claude',
-        rateLimits: {
-          primary: { usedPercent: 0, windowMinutes: 300, resetsAt: null },
-          secondary: { usedPercent: 0, windowMinutes: 10080, resetsAt: null },
-        },
-      })
-    );
-
-    expect(html).toContain('aria-valuenow="0"');
-    expect(html).not.toContain('Usage unavailable');
-  });
-});
-
-describe('multiple Claude accounts', () => {
-  it('offers another account instead of reconnecting the configured provider', () => {
-    expect(
-      providerActionLabel({
-        id: 'claude',
-        management: 'login',
-        configured: true,
-        accounts: [{ id: 'default', statusKind: 'available' }],
-      })
-    ).toBe('Add Claude account');
-    expect(
-      providerActionLabel({
-        id: 'claude',
-        management: 'login',
-        configured: false,
-        accounts: [],
-      })
-    ).toBe('Add Claude account');
-  });
 });
 
 describe('expired Claude login', () => {
@@ -135,6 +117,23 @@ describe('expired Claude login', () => {
     expect(providerActionLabel(provider)).toBe('Sign in to Claude again');
     expect(providerReloginAccountId(provider)).toBe('default');
   });
+
+  it('treats an active Claude session as a selectable local CLI session', () => {
+    const provider = {
+      id: 'claude',
+      management: 'login',
+      configured: true,
+      accounts: [{ id: 'default', active: true, statusKind: 'available' }],
+    };
+
+    expect(providerHasActiveLogin(provider)).toBe(true);
+    expect(providerPrimaryAction(provider)).toEqual({
+      label: 'Use Local CLI Session',
+      mode: 'local_session',
+      disabled: false,
+    });
+    expect(providerSecondaryLoginAction(provider)).toBeNull();
+  });
 });
 
 describe('rateLimitLabel', () => {
@@ -155,11 +154,7 @@ describe('Codex weekly usage', () => {
           active: true,
           rateLimits: {
             observedAt: '2026-07-19T10:00:00Z',
-            manualResetCredits: {
-              availableCount: 3,
-              applicableAvailableCount: 1,
-              credits: [{ title: 'Full reset', expiresAt: '2026-08-12T18:07:27Z' }],
-            },
+            manualResetCredits: { availableCount: 3, applicableAvailableCount: 1 },
             primary: {
               usedPercent: 0,
               windowMinutes: 10080,
@@ -174,7 +169,6 @@ describe('Codex weekly usage', () => {
       resetRemaining: '7d 0h remaining',
       manualResetsAvailable: 3,
       manualResetsApplicable: 1,
-      manualResetCredits: [{ title: 'Full reset', expiresAt: '2026-08-12T18:07:27Z' }],
     });
   });
 
@@ -265,17 +259,6 @@ describe('Codex weekly usage', () => {
     expect(html).toContain('3 available');
   });
 
-  it('tracks concurrent quota starts independently', () => {
-    let pending = updatePendingAccounts(new Set(), 'reviewer', true);
-    pending = updatePendingAccounts(pending, 'researcher', true);
-
-    expect([...pending]).toEqual(['reviewer', 'researcher']);
-
-    pending = updatePendingAccounts(pending, 'reviewer', false);
-
-    expect([...pending]).toEqual(['researcher']);
-  });
-
   it('shows but disables reset use when no usage window is eligible', () => {
     const html = renderToStaticMarkup(
       createElement(CodexWeeklyUsage, {
@@ -292,28 +275,6 @@ describe('Codex weekly usage', () => {
     expect(html).toContain('Use reset');
     expect(html).toContain('disabled=""');
     expect(html).toContain('No current usage window is eligible');
-  });
-
-  it('shows the expiry date for each available manual reset', () => {
-    const html = renderToStaticMarkup(
-      createElement(CodexWeeklyUsage, {
-        usage: {
-          notStarted: false,
-          resetRemaining: '2d remaining',
-          manualResetsAvailable: 2,
-          manualResetsApplicable: 1,
-          manualResetCredits: [
-            { title: 'Full reset', expiresAt: '2026-08-12T18:07:27Z' },
-            { title: 'Full reset', expiresAt: '2026-08-13T18:07:27Z' },
-          ],
-        },
-        onReset: () => {},
-      })
-    );
-
-    expect(html).toContain('Full reset · Expires Aug 12, 2026');
-    expect(html).toContain('Full reset · Expires Aug 13, 2026');
-    expect(formatResetExpiryDate('2026-08-12T18:07:27Z', 'en-US')).toBe('Aug 12, 2026');
   });
 
   it('retries at most three times while the refreshed timestamp still shows an untouched window', async () => {

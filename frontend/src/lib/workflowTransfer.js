@@ -1,7 +1,5 @@
-import { isValidKey } from './keys.js';
-
 export const WORKFLOW_FILE_KIND = 'open-kritt-workflow';
-export const WORKFLOW_FILE_VERSION = 2;
+export const WORKFLOW_FILE_VERSION = 1;
 export const WORKFLOW_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
 
 function isObjectMap(value) {
@@ -23,43 +21,13 @@ function normalizeStep(step, field) {
     throw workflowError(`${field}.name must be a string.`);
   }
   if (typeof step.content !== 'string') throw workflowError(`${field}.content must be a string.`);
-  const normalized = { name: step.name || '', content: step.content };
-  const rawClientId = step.clientId ?? step.client_id ?? step.id;
-  if (rawClientId !== undefined && rawClientId !== null) {
-    if (!['string', 'number'].includes(typeof rawClientId) || !String(rawClientId).trim()) {
-      throw workflowError(`${field}.clientId must be a non-empty string or number.`);
-    }
-    normalized.clientId = String(rawClientId).trim();
-  }
-  const rawBoundSourceStepId = step.boundSourceStepId ?? step.bound_source_step_id;
-  if (rawBoundSourceStepId !== undefined && rawBoundSourceStepId !== null) {
-    if (!['string', 'number'].includes(typeof rawBoundSourceStepId) || !String(rawBoundSourceStepId).trim()) {
-      throw workflowError(`${field}.boundSourceStepId must be a non-empty string or number.`);
-    }
-    normalized.boundSourceStepId = String(rawBoundSourceStepId).trim();
-  }
-  return normalized;
+  return { name: step.name || '', content: step.content };
 }
 
 function normalizeBoolean(value, field) {
   if (value === undefined || value === null) return false;
   if (typeof value !== 'boolean') throw workflowError(`${field} must be a boolean.`);
   return value;
-}
-
-function normalizeExtraKeys(value) {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) throw workflowError('workflow.extra must be an array.');
-  return [
-    ...new Set(
-      value.map((key, index) => {
-        if (!isValidKey(key)) {
-          throw workflowError(`workflow.extra[${index}] must be an identifier.`);
-        }
-        return key;
-      })
-    ),
-  ];
 }
 
 function normalizeLevel(level, index) {
@@ -72,18 +40,12 @@ function normalizeLevel(level, index) {
     throw workflowError(`${field}.steps must contain at least one step.`);
   }
   const consumesAll = level.consumesAll ?? level.consumeAll ?? level.consume_all_previous;
-  const steps = level.steps.map((step, stepIndex) => normalizeStep(step, `${field}.steps[${stepIndex}]`));
-  const rawBindPrevious = level.bindPrevious ?? level.bind_previous;
   return {
     depth: level.depth,
     multiOutput: normalizeBoolean(level.multiOutput, `${field}.multiOutput`),
     consumesAll: normalizeBoolean(consumesAll, `${field}.consumesAll`),
-    bindPrevious:
-      rawBindPrevious === undefined
-        ? steps.some((step) => step.boundSourceStepId !== undefined)
-        : normalizeBoolean(rawBindPrevious, `${field}.bindPrevious`),
     outputFormat: copyOutputFormat(level.outputFormat, `${field}.outputFormat`),
-    steps,
+    steps: level.steps.map((step, stepIndex) => normalizeStep(step, `${field}.steps[${stepIndex}]`)),
   };
 }
 
@@ -117,7 +79,6 @@ function levelsFromSerializedSteps(steps) {
         throw workflowError(`steps at depth ${step.depth} must share one output format and execution configuration.`);
       }
       existing.steps.push(normalizeStep(step, field));
-      existing.bindPrevious = existing.steps.some((candidate) => candidate.boundSourceStepId !== undefined);
       return;
     }
 
@@ -125,62 +86,12 @@ function levelsFromSerializedSteps(steps) {
       depth: step.depth,
       multiOutput,
       consumesAll,
-      bindPrevious: step.boundSourceStepId != null || step.bound_source_step_id != null,
       outputFormat,
       steps: [normalizeStep(step, field)],
     });
   });
 
   return [...levels.values()].sort((left, right) => left.depth - right.depth);
-}
-
-function validateBindings(levels) {
-  const allClientIds = new Set();
-  for (const [levelIndex, level] of levels.entries()) {
-    for (const [stepIndex, step] of level.steps.entries()) {
-      if (!step.clientId) continue;
-      if (allClientIds.has(step.clientId)) {
-        throw workflowError(`workflow.levels[${levelIndex}].steps[${stepIndex}].clientId is duplicated.`);
-      }
-      allClientIds.add(step.clientId);
-    }
-  }
-
-  for (const [levelIndex, level] of levels.entries()) {
-    const field = `workflow.levels[${levelIndex}]`;
-    const hasBoundSources = level.steps.some((step) => step.boundSourceStepId !== undefined);
-    if (!level.bindPrevious) {
-      if (hasBoundSources) throw workflowError(`${field} has bound sources while bindPrevious is false.`);
-      continue;
-    }
-    if (level.depth === 0) throw workflowError(`${field} cannot bind depth 0 to a previous depth.`);
-    if (level.consumesAll) throw workflowError(`${field} cannot combine bind routing with consumesAll.`);
-    const previous = levels.find((candidate) => candidate.depth === level.depth - 1);
-    if (!previous) throw workflowError(`${field} has no immediately previous depth to bind.`);
-    if (previous.steps.length < 2 || level.steps.length < 2) {
-      throw workflowError(`${field} bind routing requires at least two steps in both depths.`);
-    }
-    if (previous.steps.length !== level.steps.length) {
-      throw workflowError(`${field} must have the same number of steps as its bound source depth.`);
-    }
-    if (previous.steps.some((step) => !step.clientId) || level.steps.some((step) => !step.clientId)) {
-      throw workflowError(`${field} requires stable clientId values for every source and destination step.`);
-    }
-    const previousIds = new Set(previous.steps.map((step) => step.clientId));
-    const used = new Set();
-    for (const [stepIndex, step] of level.steps.entries()) {
-      const sourceId = step.boundSourceStepId;
-      if (!sourceId || !previousIds.has(sourceId)) {
-        throw workflowError(
-          `${field}.steps[${stepIndex}].boundSourceStepId must reference the immediately previous depth.`
-        );
-      }
-      if (used.has(sourceId)) {
-        throw workflowError(`${field}.steps[${stepIndex}].boundSourceStepId is used more than once.`);
-      }
-      used.add(sourceId);
-    }
-  }
 }
 
 function normalizeWorkflow(workflow) {
@@ -199,42 +110,19 @@ function normalizeWorkflow(workflow) {
   } else {
     levels = levelsFromSerializedSteps(workflow.steps);
   }
-  validateBindings(levels);
-  const dedupeStep3 = normalizeBoolean(workflow.dedupeStep3, 'workflow.dedupeStep3');
-  if (dedupeStep3 && !levels.some((level) => level.depth === 2)) {
-    throw workflowError('workflow.dedupeStep3 requires a depth 2.');
-  }
 
   return {
     name: workflow.name.trim(),
     description: workflow.description || '',
-    extra: normalizeExtraKeys(workflow.extra),
-    includeContextFiles: normalizeBoolean(workflow.includeContextFiles, 'workflow.includeContextFiles'),
-    dedupeStep3,
     levels,
   };
 }
 
 export function createWorkflowExport(workflow) {
-  const normalized = normalizeWorkflow(workflow);
-  const portableIds = new Map();
-  let nextStepNumber = 1;
-  for (const level of normalized.levels) {
-    for (const step of level.steps) {
-      const portableId = `step-${nextStepNumber++}`;
-      if (step.clientId) portableIds.set(step.clientId, portableId);
-      step.clientId = portableId;
-    }
-  }
-  for (const level of normalized.levels) {
-    for (const step of level.steps) {
-      if (step.boundSourceStepId) step.boundSourceStepId = portableIds.get(step.boundSourceStepId);
-    }
-  }
   return {
     kind: WORKFLOW_FILE_KIND,
     version: WORKFLOW_FILE_VERSION,
-    workflow: normalized,
+    workflow: normalizeWorkflow(workflow),
   };
 }
 
@@ -245,7 +133,7 @@ export function workflowPayloadFromImport(document) {
     if (document.kind !== WORKFLOW_FILE_KIND) {
       throw workflowError(`unsupported file kind "${document.kind || ''}".`);
     }
-    if (![1, WORKFLOW_FILE_VERSION].includes(document.version)) {
+    if (document.version !== WORKFLOW_FILE_VERSION) {
       throw workflowError(`unsupported ${WORKFLOW_FILE_KIND} version "${document.version ?? ''}".`);
     }
     return normalizeWorkflow(document.workflow);

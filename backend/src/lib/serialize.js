@@ -40,7 +40,6 @@ export function serializeStep(step) {
     depth: step.depth,
     multiOutput: step.multiOutput,
     consumesAll: step.consumesAll ?? false,
-    boundSourceStepId: step.boundSourceStepId?.toString() ?? null,
     isLast: step.isLastStep,
     content: step.content,
     outputFormat: safeParseFormat(step.outputFormat),
@@ -52,7 +51,9 @@ export function serializeWorkflow(workflow, steps, { scanCount = 0, lastUsed = n
   const ordered = [...steps].sort((a, b) => a.depth - b.depth || Number(a.id - b.id));
   const serializedSteps = ordered.map(serializeStep);
   const depths = [...new Set(serializedSteps.map((s) => s.depth))].sort((a, b) => a - b);
-  // Preserve explicitly declared workspace inputs as well as prompt references.
+  // `extra` is authoritative from the step prompts: the distinct {{extra.<key>}}
+  // sub-keys referenced anywhere in this workflow. We union with whatever is stored
+  // on the row so it's always correct, even for workflows saved before this field.
   const fromSteps = [...new Set(ordered.flatMap((s) => extractExtraKeys(s.content)))];
   const extra = [...new Set([...(workflow.extra || []), ...fromSteps])];
   return {
@@ -60,15 +61,12 @@ export function serializeWorkflow(workflow, steps, { scanCount = 0, lastUsed = n
     name: workflow.name,
     description: workflow.description ?? '',
     extra,
-    includeContextFiles: workflow.includeContextFiles === true,
-    dedupeStep3: workflow.dedupeStep3 === true,
     stepIds: (workflow.stepIds || []).map((x) => x.toString()),
     stepCount: serializedSteps.length,
     depths,
     depthChips: depths.map((d) => {
       const cnt = serializedSteps.filter((s) => s.depth === d).length;
-      const bound = serializedSteps.some((step) => step.depth === d && step.boundSourceStepId !== null);
-      return { depth: d, count: cnt, bound, label: `d${d}${cnt > 1 ? ` ×${cnt}` : ''}` };
+      return { depth: d, count: cnt, label: `d${d}${cnt > 1 ? ` ×${cnt}` : ''}` };
     }),
     steps: serializedSteps,
     scanCount,
@@ -120,7 +118,6 @@ function normalizeGeneratedWorkflow(result) {
   return {
     name: valid.name,
     description: valid.description ?? '',
-    dedupeStep3: valid.dedupeStep3 === true,
     levels: valid.levels.map((level) => ({
       depth: level.depth,
       multiOutput: level.multiOutput,
@@ -260,35 +257,10 @@ function serializeDependencies(scan) {
   }));
 }
 
-function serializeModelOverrides(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(
-        ([depth, configuration]) =>
-          /^(?:0|[1-9]\d*)$/.test(depth) &&
-          configuration &&
-          typeof configuration === 'object' &&
-          !Array.isArray(configuration)
-      )
-      .sort(([left], [right]) => Number(left) - Number(right))
-      .map(([depth, configuration]) => [
-        depth,
-        {
-          model: configuration.model ?? '',
-          modelProvider: configuration.model_provider ?? configuration.modelProvider ?? null,
-          harness: configuration.harness ?? '',
-          thinkingEffort: configuration.thinking_effort ?? configuration.thinkingEffort ?? null,
-        },
-      ])
-  );
-}
-
 export function serializeScan(
   scan,
   {
     workflowName,
-    workflowDepths = [],
     postScriptName,
     postScripts = [],
     agentSkills = [],
@@ -305,17 +277,6 @@ export function serializeScan(
 ) {
   const commit = scan.commitSha || '';
   const agentSkillIds = (scan.agentSkillIds || []).map((id) => id.toString());
-  const configuration =
-    scan.configuration && typeof scan.configuration === 'object' && !Array.isArray(scan.configuration)
-      ? scan.configuration
-      : {};
-  const postProcessingModel = configuration.post_processing_model ?? configuration.postProcessingModel;
-  const postProcessingModelProvider =
-    configuration.post_processing_model_provider ?? configuration.postProcessingModelProvider;
-  const postProcessingHarness = configuration.post_processing_harness ?? configuration.postProcessingHarness;
-  const postProcessingModelOverride = [postProcessingModel, postProcessingModelProvider, postProcessingHarness].some(
-    (value) => value !== undefined && value !== null && `${value}`.trim() !== ''
-  );
   return {
     id: scan.id.toString(),
     repoFull: scan.repoFull,
@@ -325,25 +286,14 @@ export function serializeScan(
     commitShort: commit.length > 7 ? commit.slice(0, 7) : commit,
     repoScope: scan.repoScope,
     dependencies: serializeDependencies(scan),
-    configuration,
+    configuration: scan.configuration || {},
     model: scan.model,
     modelProvider: scan.modelProvider ?? null,
     harness: scan.harness,
     thinkingEffort: scan.thinkingEffort ?? null,
-    postProcessingModel: postProcessingModel ?? scan.model,
-    postProcessingModelProvider: postProcessingModelProvider ?? scan.modelProvider ?? null,
-    postProcessingHarness: postProcessingHarness ?? scan.harness,
-    postProcessingModelOverride,
-    postProcessingThinkingEffort:
-      configuration.post_processing_thinking_effort ??
-      configuration.postProcessingThinkingEffort ??
-      scan.thinkingEffort ??
-      null,
-    modelOverrides: serializeModelOverrides(scan.modelOverrides),
     status: scan.status,
     workflowId: scan.workflowId.toString(),
     workflowName: workflowName ?? null,
-    workflowDepths,
     postScriptId: scan.postScriptId.toString(),
     postScriptName: postScriptName ?? null,
     postScripts: postScripts.map((postScript) => ({

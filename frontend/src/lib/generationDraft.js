@@ -27,13 +27,12 @@ export function workflowBuilderFromGeneration(result, nextId) {
       depth: level.depth,
       multiOutput: level.multiOutput === true,
       consumesAll: level.consumesAll === true,
-      bindPrevious: false,
       schema: objectToRows(level.outputFormat),
       steps: level.steps.map((step) => {
         if (typeof step?.name !== 'string' || typeof step?.content !== 'string') {
           throw new Error('The generated workflow has an invalid step.');
         }
-        return { id: nextId(), name: step.name, content: step.content, boundSourceStepId: null };
+        return { id: nextId(), name: step.name, content: step.content };
       }),
     };
   });
@@ -42,9 +41,6 @@ export function workflowBuilderFromGeneration(result, nextId) {
   return {
     name: result.name,
     description: typeof result.description === 'string' ? result.description : '',
-    extra: [],
-    includeContextFiles: false,
-    dedupeStep3: result.dedupeStep3 === true,
     schemaMode: 'visual',
     selStepId: levels[0].steps[0].id,
     levels,

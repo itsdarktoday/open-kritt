@@ -25,54 +25,10 @@ const PRESENTATION = {
     unit: 'workers',
     description: 'Hard cap for one scan. Set 0 to divide worker slots automatically and fairly across active scans.',
   },
-  workersPerAccount: {
-    label: 'Workers per account',
-    unit: 'workers',
-    description:
-      'Maximum concurrent root model calls assigned to the same provider account across scans. Codex subagents inside each session use their separate cap.',
-  },
   autoscaleScanWorkersOnProviderCapacity: {
-    label: 'Autoscale scan workers on capacity errors',
+    label: 'Autoscale scan workers on provider capacity errors',
     description:
-      'When a provider reports temporary server-capacity throttling or Codex reaches its separate subagent limit, lower only that scan’s future worker cap by one and retry. Account quota errors are not autoscaled.',
-    enabledDescription: 'Capacity throttles reduce the affected scan by one worker.',
-    disabledDescription: 'Worker caps remain fixed.',
-  },
-  codexMaxSubagentsPerSession: {
-    label: 'Codex subagents per session',
-    unit: 'subagents',
-    description: 'Hard cap for concurrently running child agents inside each Codex scan session.',
-  },
-  minFreeStorageGb: {
-    label: 'Minimum free storage',
-    unit: 'GiB',
-    description:
-      'Pause new scan containers when free disk space falls below this level. Lowering it can keep scans moving, but increases the risk of filling the disk completely.',
-  },
-  ignoreLowStorage: {
-    label: 'Ignore low-storage safeguard',
-    description:
-      'Allow new scan containers to start regardless of available disk space. Use only when you accept the risk of exhausting the host disk.',
-    enabledDescription: 'The minimum free-storage threshold is not enforced.',
-    disabledDescription: 'New containers pause below the configured threshold.',
-  },
-  memoryReserveGb: {
-    label: 'Docker memory reserve',
-    unit: 'GiB',
-    description:
-      'Memory withheld from scan runners for the engine, database, API, and operating overhead. The worker ceiling is reduced automatically when the remaining budget cannot fit every runner.',
-  },
-  scanRunnerMemoryMb: {
-    label: 'Runner hard memory limit',
-    unit: 'MiB',
-    description:
-      'Docker hard limit for each tool-enabled model session. A runner that exceeds this limit is terminated; set 0 only to disable the hard cap.',
-  },
-  scanRunnerMemoryReservationMb: {
-    label: 'Runner memory reservation',
-    unit: 'MiB',
-    description:
-      'Soft memory reservation used for worker-capacity planning and live admission. It may be lower than the hard limit so idle runners share unused Docker memory.',
+      'When a provider reports temporary server-capacity throttling, lower only that scan’s future worker cap by one and retry. Account quota errors are not autoscaled.',
   },
   workspaceSetupConcurrency: {
     label: 'Workspace setup concurrency',
@@ -85,12 +41,6 @@ const PRESENTATION = {
     unit: 'retries',
     description:
       'Additional attempts for retryable workflow-step and post-script failures. This does not automatically resume a failed whole scan.',
-  },
-  cyberSafetyRetryCount: {
-    label: 'Cyber-block retries',
-    unit: 'retries',
-    description:
-      'Additional attempts made only when a provider blocks a request under its cybersecurity safety policy. Set 0 to fail after the first blocked attempt.',
   },
   harnessTimeoutSeconds: {
     label: 'Model-call timeout',
@@ -160,13 +110,6 @@ export default function Settings() {
       )
     )
       return;
-    if (
-      patch.ignoreLowStorage === true &&
-      !window.confirm(
-        'Ignore the low-storage safeguard? New scan containers may fill the host disk, causing scans or other services to fail.'
-      )
-    )
-      return;
 
     setSaving(true);
     setSaveError(null);
@@ -204,10 +147,15 @@ export default function Settings() {
       {error && <ErrorState error={error} onRetry={reload} />}
       {saveError && <SettingsError error={saveError} />}
       {notice && <div className="settings-notice">{notice}</div>}
+      {data?.warnings?.map((warning) => (
+        <div className="settings-warning" key={`${warning.source}-${warning.code}`}>
+          {warning.message}
+        </div>
+      ))}
 
       {data && draft && (
         <>
-          {!data.persistence.projectEnvironment && (
+          {!data.persistence.projectEnvironment && !data?.warnings?.some((warning) => warning.source === 'project_environment') && (
             <div className="settings-warning">
               The project environment file is unavailable. Live values can be updated, but an engine recreation may
               restore deployment-provided values.
@@ -236,7 +184,33 @@ export default function Settings() {
               </div>
             </div>
 
-            <RuntimeSettingsFields data={data} draft={draft} issues={issues} saving={saving} onChange={set} />
+            <div className="settings-grid">
+              {Object.entries(PRESENTATION).map(([key, presentation]) =>
+                data.settings[key]?.type === 'boolean' ? (
+                  <BooleanRuntimeSetting
+                    key={key}
+                    name={key}
+                    presentation={presentation}
+                    setting={data.settings[key]}
+                    value={draft[key]}
+                    issue={issues[key]}
+                    disabled={saving}
+                    onChange={(value) => set(key, value)}
+                  />
+                ) : (
+                  <RuntimeSetting
+                    key={key}
+                    name={key}
+                    presentation={presentation}
+                    setting={data.settings[key]}
+                    value={draft[key]}
+                    issue={issues[key]}
+                    disabled={saving}
+                    onChange={(value) => set(key, value)}
+                  />
+                )
+              )}
+            </div>
           </section>
 
           <section className="settings-section">
@@ -268,51 +242,6 @@ export default function Settings() {
   );
 }
 
-export function RuntimeSettingsFields({ data, draft, issues, saving, onChange }) {
-  const entries = Object.entries(PRESENTATION);
-  const availableEntries = entries.filter(([key]) => data.settings?.[key]);
-  const missingLabels = entries.filter(([key]) => !data.settings?.[key]).map(([, presentation]) => presentation.label);
-
-  return (
-    <>
-      {missingLabels.length > 0 && (
-        <div className="settings-warning">
-          Some settings are unavailable from the running backend and have been hidden: {missingLabels.join(', ')}.
-          Restart the backend to load the current settings schema.
-        </div>
-      )}
-      <div className="settings-grid">
-        {availableEntries.map(([key, presentation]) =>
-          data.settings[key].type === 'boolean' ? (
-            <BooleanRuntimeSetting
-              key={key}
-              name={key}
-              presentation={presentation}
-              setting={data.settings[key]}
-              value={draft[key]}
-              issue={issues[key]}
-              disabled={saving}
-              onChange={(value) => onChange(key, value)}
-            />
-          ) : (
-            <RuntimeSetting
-              key={key}
-              name={key}
-              presentation={presentation}
-              setting={data.settings[key]}
-              value={draft[key]}
-              issue={issues[key]}
-              disabled={saving}
-              ignored={key === 'minFreeStorageGb' && draft.ignoreLowStorage}
-              onChange={(value) => onChange(key, value)}
-            />
-          )
-        )}
-      </div>
-    </>
-  );
-}
-
 function BooleanRuntimeSetting({ name, presentation, setting, value, issue, disabled, onChange }) {
   return (
     <article className="settings-card">
@@ -324,7 +253,9 @@ function BooleanRuntimeSetting({ name, presentation, setting, value, issue, disa
       <label className="settings-toggle-row" htmlFor={`setting-${name}`}>
         <span>
           <strong>{value ? 'Enabled' : 'Disabled'}</strong>
-          <small>{value ? presentation.enabledDescription : presentation.disabledDescription}</small>
+          <small>
+            {value ? 'Capacity throttles reduce the affected scan by one worker.' : 'Worker caps remain fixed.'}
+          </small>
         </span>
         <input
           id={`setting-${name}`}
@@ -342,18 +273,16 @@ function BooleanRuntimeSetting({ name, presentation, setting, value, issue, disa
       <div className="settings-card-meta">
         <span className="mono settings-env-key">{setting.envKey}</span>
         <span>{SOURCE_LABELS[setting.source] || setting.source}</span>
-        <span>Default {setting.defaultValue ? 'enabled' : 'disabled'}</span>
+        <span>Default enabled</span>
       </div>
     </article>
   );
 }
 
-function RuntimeSetting({ name, presentation, setting, value, issue, disabled, ignored, onChange }) {
-  const rawValue = `${value}`.trim();
-  const numericValue = rawValue && Number.isFinite(Number(rawValue)) ? Number(rawValue) : null;
+function RuntimeSetting({ name, presentation, setting, value, issue, disabled, onChange }) {
+  const numericValue = /^-?\d+$/.test(`${value}`.trim()) ? Number(value) : null;
   const aboveRecommendation = numericValue !== null && numericValue > setting.recommendedMax;
   const paused = name === 'workerCount' && numericValue === 0;
-  const cyberRetryEnabled = name === 'cyberSafetyRetryCount' && numericValue !== null && numericValue > 0;
   return (
     <article className="settings-card">
       <div className="settings-card-topline">
@@ -371,10 +300,10 @@ function RuntimeSetting({ name, presentation, setting, value, issue, disabled, i
         id={`setting-${name}`}
         className="mono settings-number-input"
         type="number"
-        inputMode={setting.type === 'number' ? 'decimal' : 'numeric'}
+        inputMode="numeric"
         min={setting.min}
         max={setting.max}
-        step={setting.step || 1}
+        step="1"
         value={value}
         disabled={disabled}
         aria-invalid={Boolean(issue) || !setting.valid}
@@ -384,15 +313,11 @@ function RuntimeSetting({ name, presentation, setting, value, issue, disabled, i
       {!setting.valid && !issue && (
         <div className="settings-field-error">The stored value was invalid; the safe default is shown.</div>
       )}
-      {(aboveRecommendation || paused || ignored || cyberRetryEnabled) && !issue && (
+      {(aboveRecommendation || paused) && !issue && (
         <div className="settings-field-warning">
-          {ignored
-            ? 'This threshold is preserved but not enforced while the low-storage safeguard is ignored.'
-            : paused
-              ? 'New engine work will remain queued until worker slots are raised above zero.'
-              : cyberRetryEnabled
-                ? `A blocked request may run up to ${numericValue + 1} total attempts. The provider may reject every attempt.`
-                : `Above the conservative recommendation of ${setting.recommendedMax}; verify provider and host capacity.`}
+          {paused
+            ? 'New engine work will remain queued until worker slots are raised above zero.'
+            : `Above the conservative recommendation of ${setting.recommendedMax}; verify provider and host capacity.`}
         </div>
       )}
       <div className="settings-card-meta">

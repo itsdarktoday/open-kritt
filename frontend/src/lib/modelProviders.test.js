@@ -60,11 +60,12 @@ const modelCatalog = configuredModelCatalog({
 });
 
 describe('configuredModelProviders', () => {
-  it('uses only supported provider IDs returned by the API', () => {
+  it('keeps normalized provider IDs returned by the API, including custom providers', () => {
     expect(configuredModelProviders({ providers: ['OPENROUTER', 'unknown', 'claude', 'codex', 'codex'] })).toEqual([
-      'codex',
-      'claude',
       'openrouter',
+      'unknown',
+      'claude',
+      'codex',
     ]);
   });
 
@@ -116,11 +117,17 @@ describe('model catalog', () => {
       ],
     });
 
-    expect(Object.keys(catalog)).toEqual(['codex']);
+    expect(Object.keys(catalog)).toEqual(['codex', 'unknown']);
     expect(modelCatalogForProvider(catalog, 'codex')).toMatchObject({
       input: 'select',
       status: 'ready',
       defaultModel: 'gpt-5-codex',
+    });
+    expect(modelCatalogForProvider(catalog, 'unknown')).toMatchObject({
+      input: 'text',
+      status: 'ready',
+      label: 'Unknown',
+      harnesses: [],
     });
     expect(modelsForModelProvider(catalog, 'codex')).toEqual([
       {
@@ -247,5 +254,28 @@ describe('model provider harnesses', () => {
   it('returns no harness for an unsupported provider', () => {
     expect(harnessesForModelProvider('unknown')).toEqual([]);
     expect(defaultHarnessForModelProvider('unknown')).toBe('');
+  });
+
+  it('uses the OpenAI-compatible harness for custom providers', () => {
+    const customCatalog = configuredModelCatalog({
+      providers: [
+        {
+          provider: 'my-gateway',
+          label: 'My Gateway',
+          input: 'text',
+          status: 'ready',
+          defaultModel: 'gateway-model',
+          models: [{ id: 'gateway-model', thinkingEfforts: ['medium', 'high'], isDefault: true }],
+          harnesses: ['openai-compatible'],
+        },
+      ],
+    });
+
+    expect(harnessesForModelProvider('my-gateway', customCatalog)).toEqual(['openai-compatible']);
+    expect(defaultHarnessForModelProvider('my-gateway', customCatalog)).toBe('openai-compatible');
+    expect(thinkingEffortsForModel(customCatalog, 'my-gateway', 'gateway-model', [], 'openai-compatible')).toEqual([
+      'medium',
+      'high',
+    ]);
   });
 });

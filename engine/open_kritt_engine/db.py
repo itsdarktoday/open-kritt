@@ -1,4 +1,5 @@
 import json
+import random
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -13,25 +14,25 @@ from .models import Step, StepResultRow, Workflow
 
 RATE_LIMIT_RETRY_BASE_SECONDS = 60.0
 RATE_LIMIT_RETRY_MAX_SECONDS = 10 * 60.0
-QUOTA_RETRY_MAX_SECONDS = 30 * 60.0
+RATE_LIMIT_RETRY_JITTER_RATIO = 0.15
 QUEUED_SCAN_ADMISSION_LOCK = (0x6B726974, 0x71756575)
 
 
-def rate_limit_retry_delay(
-    retry_count: int,
-    provider_retry_after_seconds: float = 0.0,
-    *,
-    maximum_seconds: float = RATE_LIMIT_RETRY_MAX_SECONDS,
-) -> float:
+def rate_limit_retry_delay(retry_count: int, provider_retry_after_seconds: float = 0.0) -> float:
     """Return the persistent retry delay for a rate-limited scan."""
 
-    maximum_seconds = max(RATE_LIMIT_RETRY_BASE_SECONDS, float(maximum_seconds))
     exponent = max(0, retry_count - 1)
     exponential_delay = (
-        maximum_seconds if exponent >= 8 else min(RATE_LIMIT_RETRY_BASE_SECONDS * (2**exponent), maximum_seconds)
+        RATE_LIMIT_RETRY_MAX_SECONDS
+        if exponent >= 8
+        else min(RATE_LIMIT_RETRY_BASE_SECONDS * (2**exponent), RATE_LIMIT_RETRY_MAX_SECONDS)
     )
     provider_delay = max(0.0, float(provider_retry_after_seconds))
-    return min(max(exponential_delay, provider_delay), maximum_seconds)
+    base_delay = min(max(exponential_delay, provider_delay), RATE_LIMIT_RETRY_MAX_SECONDS)
+    jitter = min(RATE_LIMIT_RETRY_MAX_SECONDS - base_delay, base_delay * RATE_LIMIT_RETRY_JITTER_RATIO)
+    if jitter <= 0:
+        return base_delay
+    return min(base_delay + random.uniform(0.0, jitter), RATE_LIMIT_RETRY_MAX_SECONDS)
 
 
 def _json(value):
@@ -126,13 +127,7 @@ class Database:
                    OR (
                       status = 'rate_limited'
                       AND reasoning->>'retry_after' IS NOT NULL
-                      AND (
-                          (reasoning->>'retry_after')::timestamptz <= now()
-                          OR (
-                              reasoning->>'limit_kind' IN ('account_quota_limited', 'subagent_limited')
-                              AND updated_at + make_interval(secs => %s::double precision) <= now()
-                          )
-                      )
+                      AND (reasoning->>'retry_after')::timestamptz <= now()
                   )
                 ORDER BY inserted_at ASC
                 FOR UPDATE SKIP LOCKED
@@ -153,8 +148,7 @@ class Database:
             FROM next_scan
             WHERE s.id = next_scan.id
             RETURNING s.*
-            """,
-                (QUOTA_RETRY_MAX_SECONDS,),
+            """
             ).fetchone()
 
         if active_count == 0 and not admitted:
@@ -571,15 +565,7 @@ class Database:
         if not isinstance(previous_retries, int) or isinstance(previous_retries, bool) or previous_retries < 0:
             previous_retries = 0
         retry_count = previous_retries + 1
-        retry_delay_seconds = rate_limit_retry_delay(
-            retry_count,
-            retry_after_seconds,
-            maximum_seconds=(
-                QUOTA_RETRY_MAX_SECONDS
-                if limit_kind in {"account_quota_limited", "subagent_limited"}
-                else RATE_LIMIT_RETRY_MAX_SECONDS
-            ),
-        )
+        retry_delay_seconds = rate_limit_retry_delay(retry_count, retry_after_seconds)
 
         next_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
         next_reasoning.update(
@@ -588,9 +574,13 @@ class Database:
                 "limit_kind": limit_kind,
                 "error": error,
                 "retry_count": retry_count,
+                "retry_strategy": "exponential_backoff_with_jitter",
+                "provider_retry_after_seconds": max(0.0, float(retry_after_seconds)),
+                "backoff_seconds": retry_delay_seconds,
+                "retry_eta_seconds": retry_delay_seconds,
             }
         )
-        if autoscale_workers and limit_kind in {"provider_throttled", "subagent_limited"}:
+        if autoscale_workers and limit_kind == "provider_throttled":
             stored_cap = next_reasoning.get("provider_capacity_worker_cap")
             if not isinstance(stored_cap, int) or isinstance(stored_cap, bool) or stored_cap < 1:
                 stored_cap = current_worker_cap
@@ -720,96 +710,15 @@ class Database:
                     output_table=row["output_table"],
                     order=order,
                     consumes_all=bool(row.get("consume_all_previous", False)),
-                    bound_source_step_id=(
-                        _to_int(row["bound_source_step_id"]) if row.get("bound_source_step_id") is not None else None
-                    ),
                 )
             )
-        return Workflow(
-            id=_to_int(workflow["id"]),
-            name=workflow["name"],
-            steps=tuple(steps),
-            include_context_files=bool(workflow.get("include_context_files", False)),
-            dedupe_step_3=bool(workflow.get("dedupe_step_3", False)),
-        )
-
-    def load_pre_step_3_dedupe_candidates(
-        self,
-        conn,
-        *,
-        scan_id: int,
-        workflow_id: int,
-        metadata_id: int,
-        current_prev_id: int,
-    ) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT ON (m.prev_id)
-                   m.prev_id AS id,
-                   m.status,
-                   s.name AS step_name,
-                   r.json_answer AS result
-            FROM workflows.step_metadata m
-            JOIN public.steps s ON s.id = m.step_id
-            JOIN workflows.step_results r
-              ON r.scan_id = m.scan_id
-             AND r.id = m.prev_id
-            WHERE m.scan_id = %(scan_id)s
-              AND m.workflow_id = %(workflow_id)s
-              AND coalesce(m.kind, 'step') = 'step'
-              AND s.depth = 2
-              AND m.status IN ('running', 'completed')
-              AND m.id < %(metadata_id)s
-              AND m.prev_id IS NOT NULL
-              AND m.prev_id <> %(current_prev_id)s
-            ORDER BY m.prev_id, m.id DESC
-            """,
-            {
-                "scan_id": scan_id,
-                "workflow_id": workflow_id,
-                "metadata_id": metadata_id,
-                "current_prev_id": current_prev_id,
-            },
-        ).fetchall()
-        return [
-            {
-                "id": _to_int(row["id"]),
-                "status": row["status"],
-                "step_name": row["step_name"],
-                "result": row["result"] if isinstance(row["result"], dict) else {},
-            }
-            for row in rows
-        ]
-
-    def load_default_model(self, conn, provider: str) -> str | None:
-        row = conn.execute(
-            "SELECT default_model FROM public.model_catalogs WHERE provider = %s",
-            (provider,),
-        ).fetchone()
-        value = row.get("default_model") if row else None
-        normalized = str(value or "").strip()
-        return normalized or None
+        return Workflow(id=_to_int(workflow["id"]), name=workflow["name"], steps=tuple(steps))
 
     def load_completed_metadata(self, conn, scan_id: int) -> set[tuple[int, int, str | None, int]]:
         return self.load_metadata_keys(conn, scan_id, ("completed",))
 
     def load_claimed_metadata(self, conn, scan_id: int) -> set[tuple[int, int, str | None, int]]:
         return self.load_metadata_keys(conn, scan_id, ("completed", "running"))
-
-    def load_attempted_metadata(self, conn, scan_id: int) -> set[tuple[int, int, str | None, int]]:
-        rows = conn.execute(
-            """
-            SELECT step_id, coalesce(prev_id, 0) AS prev_id, prev_table, coalesce(repeat_run, 1) AS repeat_run
-            FROM workflows.step_metadata
-            WHERE scan_id = %s
-              AND coalesce(kind, 'step') = 'step'
-            """,
-            (scan_id,),
-        ).fetchall()
-        return {
-            (_to_int(row["step_id"]), _to_int(row["prev_id"]), row["prev_table"], int(row["repeat_run"]))
-            for row in rows
-        }
 
     def load_metadata_keys(
         self, conn, scan_id: int, statuses: tuple[str, ...]
@@ -991,13 +900,7 @@ class Database:
         post_script_name: str | None = None,
         vulnerability_id: int | None = None,
     ) -> int | None:
-        # Batch indexes are chosen before this transaction. Lock batch pipelines by
-        # logical kind so two workers cannot turn the same snapshot into different
-        # batch indexes; post-script jobs remain independently claimable.
-        if kind == "post_script":
-            lock_key = f"post-process:{scan_id}:{kind}:{post_script_id or 0}:{vulnerability_id or 0}"
-        else:
-            lock_key = f"post-process:{scan_id}:{kind}"
+        lock_key = f"post-process:{scan_id}:{kind}:{batch_index or 0}:{post_script_id or 0}:{vulnerability_id or 0}"
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
         scan = conn.execute(
             """
@@ -1026,44 +929,20 @@ class Database:
                 (scan_id, kind, vulnerability_id, post_script_id),
             ).fetchone()
         else:
-            # The scan row lock serializes this recheck with every other claim.
             existing = conn.execute(
                 """
                 SELECT id
                 FROM workflows.post_process_metadata
                 WHERE scan_id = %s
                   AND kind = %s
-                  AND (
-                      status = 'running'
-                      OR (batch_index = %s AND status = 'completed')
-                  )
+                  AND batch_index = %s
+                  AND status IN ('running', 'completed')
                 LIMIT 1
                 """,
                 (scan_id, kind, batch_index),
             ).fetchone()
         if existing:
             return None
-        expected_target_ids = sorted(set(target_vulnerability_ids))
-        if kind in {"dedupe", "ranker"}:
-            if not expected_target_ids:
-                return None
-            target_state = (
-                "dedupe_is_canonical IS NULL"
-                if kind == "dedupe"
-                else "dedupe_is_canonical = true AND bounty_rank IS NULL"
-            )
-            eligible = conn.execute(
-                f"""
-                SELECT count(*) AS count
-                FROM workflows.vulnerabilities
-                WHERE scan_id = %s
-                  AND id = ANY(%s::bigint[])
-                  AND {target_state}
-                """,
-                (scan_id, expected_target_ids),
-            ).fetchone()
-            if int(eligible["count"]) != len(expected_target_ids):
-                return None
         previous = conn.execute(
             """
             SELECT id
@@ -1610,12 +1489,6 @@ class Database:
         codex_source_home: str | None = None,
         codex_account_id: str | None = None,
         codex_account_email: str | None = None,
-        output_json: dict[str, Any] | None = None,
-        duplicate_of_prev_id: int | None = None,
-        model: str | None = None,
-        harness: str | None = None,
-        thinking_effort: str | None = None,
-        model_provider: str | None = None,
     ):
         conn.execute(
             """
@@ -1627,8 +1500,6 @@ class Database:
                 checked_out_commit = coalesce(%(checked_out_commit)s, checked_out_commit),
                 stub = coalesce(%(stub)s, stub),
                 stub_explanation = coalesce(%(stub_explanation)s, stub_explanation),
-                output_json = coalesce(%(output_json)s, output_json),
-                duplicate_of_prev_id = coalesce(%(duplicate_of_prev_id)s, duplicate_of_prev_id),
                 run_time_ms = %(run_time_ms)s,
                 raw_token_usage = %(raw_token_usage)s,
                 token_count_cached_input = %(cached_input)s,
@@ -1641,10 +1512,6 @@ class Database:
                 codex_source_home = coalesce(%(codex_source_home)s, codex_source_home),
                 codex_account_id = coalesce(%(codex_account_id)s, codex_account_id),
                 codex_account_email = coalesce(%(codex_account_email)s, codex_account_email),
-                model = coalesce(%(model)s, model),
-                harness = coalesce(%(harness)s, harness),
-                thinking_effort = coalesce(%(thinking_effort)s, thinking_effort),
-                model_provider = coalesce(%(model_provider)s, model_provider),
                 updated_at = now()
             WHERE id = %(metadata_id)s
             """,
@@ -1669,12 +1536,6 @@ class Database:
                 "stub": stub,
                 "stub_explanation": stub_explanation,
                 "prompt_filled": prompt_filled,
-                "output_json": _json(output_json),
-                "duplicate_of_prev_id": duplicate_of_prev_id,
-                "model": model,
-                "harness": harness,
-                "thinking_effort": thinking_effort,
-                "model_provider": model_provider,
             },
         )
 
@@ -1816,7 +1677,6 @@ class Database:
         conn,
         *,
         retain_inactive_scan_caches_after: datetime,
-        retain_finished_workspaces_after: datetime,
     ) -> tuple[set[int], set[int]]:
         # Keep cleanup mutually exclusive with scan admission. This prevents a
         # completed/failed scan from being resumed while its stale cache is
@@ -1827,14 +1687,14 @@ class Database:
             """
             SELECT id::bigint AS workspace_id
             FROM workflows.step_metadata
-            WHERE (status = 'running' OR updated_at >= %s)
+            WHERE status = 'running'
               AND coalesce(kind, 'step') = 'step'
             UNION ALL
             SELECT (%s::bigint + id)::bigint AS workspace_id
             FROM workflows.post_process_metadata
-            WHERE status = 'running' OR updated_at >= %s
+            WHERE status = 'running'
             """,
-            (retain_finished_workspaces_after, POST_WORKSPACE_ID_OFFSET, retain_finished_workspaces_after),
+            (POST_WORKSPACE_ID_OFFSET,),
         ).fetchall()
         scan_rows = conn.execute(
             """
@@ -1852,15 +1712,6 @@ class Database:
             {_to_int(row["workspace_id"]) for row in workspace_rows},
             {_to_int(row["id"]) for row in scan_rows},
         )
-
-    def load_active_scan_cache_specs(self, conn) -> list[dict[str, Any]]:
-        return conn.execute(
-            """
-            SELECT id, repo_kind, repo_full, commit_sha, dependencies, dependencies_detail
-            FROM public.scans
-            WHERE status IN ('queued', 'pending', 'prewarming_cache', 'running', 'rate_limited', 'post_processing')
-            """
-        ).fetchall()
 
 
 def now_utc():

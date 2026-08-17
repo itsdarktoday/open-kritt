@@ -1,36 +1,15 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
-import express from 'express';
-
-import { consumeCodexManualReset, fetchExecutorAccounts, fetchExecutorProvider } from '../src/lib/accounts.js';
-import { createAccountsRouter } from '../src/routes/accounts.js';
-
-async function requestRouter(router, path = '/') {
-  const app = express();
-  app.use(router);
-  const server = app.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const { port } = server.address();
-
-  try {
-    return await fetch(`http://127.0.0.1:${port}${path}`);
-  } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-  }
-}
-
-test('account API responses cannot be stored by browser caches', async () => {
-  const router = createAccountsRouter({
-    getSummary: () => ({ providers: [] }),
-  });
-
-  const response = await requestRouter(router, '/summary');
-
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-});
+import {
+  consumeCodexManualReset,
+  fetchExecutorAccounts,
+  getAccountProvider,
+  getAccountsOverview,
+} from '../src/lib/accounts.js';
 
 test('executor account integration loads each provider independently with the distinct internal bearer token', async (t) => {
   const originalFetch = globalThis.fetch;
@@ -70,127 +49,6 @@ test('executor account integration loads each provider independently with the di
   );
   assert.ok(requests.every((request) => request.options.headers.Authorization === 'Bearer backend-only-token'));
   assert.ok(requests.every((request) => request.options.redirect === 'error'));
-});
-
-test('Claude account refresh renews a rejected login and retries live usage once', async (t) => {
-  const originalFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-  let requestCount = 0;
-  globalThis.fetch = async () => {
-    requestCount += 1;
-    return {
-      ok: true,
-      async json() {
-        return {
-          kind: 'claude',
-          accounts: [
-            requestCount === 1
-              ? { status: 'sign-in required', statusKind: 'expired' }
-              : { status: 'limit reached', statusKind: 'limited' },
-          ],
-        };
-      },
-    };
-  };
-  const renewals = [];
-
-  const provider = await fetchExecutorProvider('claude', {
-    refresh: true,
-    executorViewUrl: 'http://executor-view:8090',
-    internalToken: 'backend-only-token',
-    claudeHome: '/provider-homes/claude',
-    renewClaudeLogin: async (home) => {
-      renewals.push(home);
-      return true;
-    },
-  });
-
-  assert.equal(requestCount, 2);
-  assert.deepEqual(renewals, ['/provider-homes/claude']);
-  assert.equal(provider.accounts[0].statusKind, 'limited');
-});
-
-test('Claude account refresh preserves sign-in status when credential renewal fails', async (t) => {
-  const originalFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-  let requestCount = 0;
-  globalThis.fetch = async () => {
-    requestCount += 1;
-    return {
-      ok: true,
-      async json() {
-        return {
-          kind: 'claude',
-          accounts: [{ status: 'sign-in required', statusKind: 'expired' }],
-        };
-      },
-    };
-  };
-
-  const provider = await fetchExecutorProvider('claude', {
-    refresh: true,
-    executorViewUrl: 'http://executor-view:8090',
-    internalToken: 'backend-only-token',
-    renewClaudeLogin: async () => false,
-  });
-
-  assert.equal(requestCount, 1);
-  assert.equal(provider.accounts[0].statusKind, 'expired');
-});
-
-test('Claude account refresh renews each rejected managed account in its own home', async (t) => {
-  const originalFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
-  let requestCount = 0;
-  globalThis.fetch = async () => {
-    requestCount += 1;
-    return {
-      ok: true,
-      async json() {
-        return {
-          kind: 'claude',
-          accounts:
-            requestCount === 1
-              ? [
-                  { id: 'reviewer', statusKind: 'expired' },
-                  { id: 'researcher', statusKind: 'expired' },
-                ]
-              : [
-                  { id: 'reviewer', statusKind: 'available' },
-                  { id: 'researcher', statusKind: 'available' },
-                ],
-        };
-      },
-    };
-  };
-  const renewals = [];
-
-  const provider = await fetchExecutorProvider('claude', {
-    refresh: true,
-    executorViewUrl: 'http://executor-view:8090',
-    internalToken: 'backend-only-token',
-    claudeAccountsRoot: '/provider-homes/claude-accounts',
-    renewClaudeLogin: async (home) => {
-      renewals.push(home);
-      return true;
-    },
-  });
-
-  assert.equal(requestCount, 2);
-  assert.deepEqual(renewals, [
-    '/provider-homes/claude-accounts/reviewer/.claude',
-    '/provider-homes/claude-accounts/researcher/.claude',
-  ]);
-  assert.deepEqual(
-    provider.accounts.map((account) => account.statusKind),
-    ['available', 'available']
-  );
 });
 
 test('executor account integration fails closed when its internal token is unavailable', async (t) => {
@@ -240,4 +98,75 @@ test('Codex reset integration uses only the selected internal account endpoint',
   assert.equal(request.url, 'http://executor-view:8090/api/accounts/codex/account%2Fone/reset');
   assert.equal(request.options.method, 'POST');
   assert.equal(request.options.headers.Authorization, 'Bearer backend-only-token');
+});
+
+test('account provider falls back to local Codex runtime homes when executor detail is unavailable', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'open-kritt-accounts-codex-fallback-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const primaryHome = join(directory, 'codex-primary');
+  const runtimeConfigPath = join(directory, 'engine-runtime.env');
+  await mkdir(primaryHome, { recursive: true });
+  const payload = Buffer.from(JSON.stringify({ email: 'reviewer@example.com', name: 'Reviewer' })).toString('base64url');
+  await writeFile(join(primaryHome, 'auth.json'), JSON.stringify({ tokens: { id_token: `header.${payload}.sig` } }));
+  await writeFile(runtimeConfigPath, 'ENGINE_CODEX_HOME=/runtime/.codex\n');
+
+  const provider = await getAccountProvider('codex', {
+    statusOptions: {
+      env: {},
+      credentialsPath: join(directory, 'missing-credentials.json'),
+      loginOptions: {
+        codex: {
+          primaryHome,
+          runtimeConfigPath,
+          runtimePrimaryHome: '/runtime/.codex',
+        },
+      },
+    },
+    executorOptions: {
+      internalToken: '',
+      internalTokenFile: join(directory, 'missing-token'),
+    },
+  });
+
+  assert.equal(provider.loadError, null);
+  assert.equal(provider.source, 'codex_login');
+  assert.equal(provider.active, 1);
+  assert.equal(provider.total, 1);
+  assert.deepEqual(provider.accounts.map((account) => account.id), ['primary']);
+  assert.equal(provider.accounts[0].email, 'reviewer@example.com');
+  assert.equal(provider.accounts[0].statusKind, 'available');
+});
+
+test('accounts overview preserves local Claude sessions when executor detail is unavailable', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'open-kritt-accounts-claude-fallback-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const claudeHome = join(directory, '.claude');
+  await mkdir(claudeHome, { recursive: true });
+  await writeFile(
+    join(claudeHome, '.credentials.json'),
+    JSON.stringify({
+      claudeAiOauth: { accessToken: 'token', refreshToken: 'refresh', expiresAt: Date.parse('2026-08-01T00:00:00Z') },
+      email: 'claude@example.com',
+      subscriptionType: 'max',
+    })
+  );
+
+  const overview = await getAccountsOverview({
+    statusOptions: {
+      env: {},
+      credentialsPath: join(directory, 'missing-credentials.json'),
+      loginOptions: { claude: { home: claudeHome } },
+    },
+    executorOptions: {
+      internalToken: '',
+      internalTokenFile: join(directory, 'missing-token'),
+    },
+  });
+
+  const claude = overview.providers.find((provider) => provider.id === 'claude');
+  assert.equal(claude.source, 'claude_login');
+  assert.equal(claude.active, 1);
+  assert.equal(claude.total, 1);
+  assert.equal(claude.accounts[0].email, 'claude@example.com');
+  assert.equal(claude.accounts[0].status, 'logged in');
 });

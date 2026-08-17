@@ -87,7 +87,9 @@ test('model catalog helpers sanitize cached models and report input readiness', 
       providers: [
         {
           provider: 'codex',
+          label: 'Codex',
           input: 'select',
+          harnesses: ['codex'],
           models: [
             {
               id: 'gpt-5-codex',
@@ -110,18 +112,14 @@ test('model catalog helpers sanitize cached models and report input readiness', 
         },
         {
           provider: 'claude',
+          label: 'Claude',
           input: 'select',
+          harnesses: ['claude-code'],
           models: [
             {
               id: 'claude-fable-5',
               label: 'Fable 5',
               note: 'Cyber requests may route to Opus 4.8.',
-              thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-              isDefault: false,
-            },
-            {
-              id: 'claude-opus-5',
-              label: 'Opus 5',
               thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
               isDefault: false,
             },
@@ -153,7 +151,15 @@ test('model catalog helpers sanitize cached models and report input readiness', 
           defaultModel: 'claude-sonnet-5',
           status: 'ready',
         },
-        { provider: 'openrouter', input: 'text', models: [], defaultModel: null, status: 'loading' },
+        {
+          provider: 'openrouter',
+          label: 'OpenRouter',
+          input: 'text',
+          harnesses: ['codex', 'claude-code'],
+          models: [],
+          defaultModel: null,
+          status: 'loading',
+        },
       ],
     }
   );
@@ -187,7 +193,6 @@ test('cached model lookup identifies exact catalog entries', () => {
   assert.equal(isCachedModel('codex', 'other-model', catalog), false);
   assert.equal(isCachedModel('claude', 'claude-sonnet-5', null), true);
   assert.equal(isCachedModel('claude', 'claude-fable-5', null), true);
-  assert.equal(isCachedModel('claude', 'claude-opus-5', null), true);
   assert.equal(isCachedModel('claude', 'claude-opus-4-8', null), true);
   assert.equal(isCachedModel('claude', 'claude-sonnet-4', null), false);
   assert.equal(isCachedModel('openrouter', 'any/provider-model', null), false);
@@ -224,7 +229,9 @@ test('OpenRouter exposes cached suggestions while keeping free-text input', () =
     providers: [
       {
         provider: 'openrouter',
+        label: 'OpenRouter',
         input: 'text',
+        harnesses: ['codex', 'claude-code'],
         models: [
           {
             id: 'vendor/code-model',
@@ -252,6 +259,7 @@ test('OpenRouter exposes cached suggestions while keeping free-text input', () =
     'unavailable'
   );
 });
+
 
 test('model catalog endpoint returns only configured providers', async () => {
   let requestedCatalogProviders;
@@ -281,7 +289,9 @@ test('model catalog endpoint returns only configured providers', async () => {
     providers: [
       {
         provider: 'codex',
+        label: 'Codex',
         input: 'select',
+        harnesses: ['codex'],
         models: [
           {
             id: 'gpt-5-codex',
@@ -295,7 +305,9 @@ test('model catalog endpoint returns only configured providers', async () => {
       },
       {
         provider: 'openrouter',
+        label: 'OpenRouter',
         input: 'text',
+        harnesses: ['codex', 'claude-code'],
         models: [
           {
             id: 'vendor/code-model',

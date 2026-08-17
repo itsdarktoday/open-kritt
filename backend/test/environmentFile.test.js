@@ -30,7 +30,7 @@ test('environment file updates preserve unrelated values and replace duplicates'
   assert.equal(values.CODEX_LOGIN_CONFIGURED, '1');
   assert.equal((text.match(/^ENGINE_CODEX_HOME=/gm) || []).length, 1);
   assert.match(text, /^# Keep this comment$/m);
-  assert.equal((await stat(environmentFilePath)).mode & 0o777, 0o600);
+  assert.equal((await stat(environmentFilePath)).mode & 0o600, 0o600);
 });
 
 test('concurrent environment updates do not overwrite each other', async (t) => {

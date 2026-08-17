@@ -23,8 +23,6 @@ describe('workflow transfer files', () => {
       id: '701',
       name: 'Endpoint inventory',
       description: 'Map public application endpoints.',
-      extra: ['whitepaper'],
-      includeContextFiles: true,
       insertedAt: '2026-07-20T00:00:00Z',
       scanCount: 9,
       steps: [
@@ -55,29 +53,24 @@ describe('workflow transfer files', () => {
 
     expect(exported).toEqual({
       kind: 'open-kritt-workflow',
-      version: 2,
+      version: 1,
       workflow: {
         name: 'Endpoint inventory',
         description: 'Map public application endpoints.',
-        extra: ['whitepaper'],
-        includeContextFiles: true,
-        dedupeStep3: false,
         levels: [
           {
             depth: 0,
             multiOutput: true,
             consumesAll: false,
-            bindPrevious: false,
             outputFormat: { endpoint: 'string' },
-            steps: [{ clientId: 'step-1', name: 'Collect', content: 'Collect endpoints from {{repo_full}}.' }],
+            steps: [{ name: 'Collect', content: 'Collect endpoints from {{repo_full}}.' }],
           },
           {
             depth: 1,
             multiOutput: false,
             consumesAll: true,
-            bindPrevious: false,
             outputFormat: terminalFormat,
-            steps: [{ clientId: 'step-2', name: 'Summarize', content: 'Summarize {{multi_output_depth_0}}.' }],
+            steps: [{ name: 'Summarize', content: 'Summarize {{multi_output_depth_0}}.' }],
           },
         ],
       },
@@ -106,48 +99,12 @@ describe('workflow transfer files', () => {
     });
 
     expect(payload.name).toBe('Imported workflow');
-    expect(payload.extra).toEqual([]);
-    expect(payload.includeContextFiles).toBe(false);
-    expect(payload.dedupeStep3).toBe(false);
     expect(payload.levels[0]).toMatchObject({
       depth: 0,
       multiOutput: true,
       consumesAll: false,
-      bindPrevious: false,
       steps: [{ name: 'Analyze', content: 'Analyze {{repo_full}}.' }],
     });
-  });
-
-  it('preserves enabled step 3 dedupe for workflows with depth 2', () => {
-    const payload = workflowPayloadFromImport({
-      name: 'Three-stage review',
-      dedupeStep3: true,
-      levels: [
-        {
-          depth: 0,
-          multiOutput: true,
-          outputFormat: { entrypoint: 'string' },
-          steps: [{ content: 'Map entrypoints.' }],
-        },
-        {
-          depth: 1,
-          multiOutput: true,
-          outputFormat: { candidate: 'string' },
-          steps: [{ content: 'Find candidates.' }],
-        },
-        {
-          depth: 2,
-          multiOutput: true,
-          outputFormat: terminalFormat,
-          steps: [{ content: 'Verify candidate.' }],
-        },
-      ],
-    });
-
-    expect(payload.dedupeStep3).toBe(true);
-    expect(() => workflowPayloadFromImport({ ...payload, levels: payload.levels.slice(0, 2) })).toThrow(
-      'workflow.dedupeStep3 requires a depth 2'
-    );
   });
 
   it('imports the existing flat API representation and enforces shared depth configuration', () => {
@@ -179,19 +136,15 @@ describe('workflow transfer files', () => {
     expect(payload).toEqual({
       name: 'Manual API export',
       description: '',
-      extra: [],
-      includeContextFiles: false,
-      dedupeStep3: false,
       levels: [
         {
           depth: 0,
           multiOutput: true,
           consumesAll: false,
-          bindPrevious: false,
           outputFormat: terminalFormat,
           steps: [
-            { clientId: '902', name: 'First sibling', content: 'Inspect {{repo_full}}.' },
-            { clientId: '903', name: 'Second sibling', content: 'Inspect {{repo_scope}}.' },
+            { name: 'First sibling', content: 'Inspect {{repo_full}}.' },
+            { name: 'Second sibling', content: 'Inspect {{repo_scope}}.' },
           ],
         },
       ],
@@ -210,139 +163,10 @@ describe('workflow transfer files', () => {
 
   it('rejects malformed JSON and unsupported transfer versions', () => {
     expect(() => parseWorkflowImport('{not json')).toThrow('not valid JSON');
-    expect(() => workflowPayloadFromImport({ kind: 'open-kritt-workflow', version: 3, workflow: {} })).toThrow(
-      'unsupported open-kritt-workflow version "3"'
+    expect(() => workflowPayloadFromImport({ kind: 'open-kritt-workflow', version: 2, workflow: {} })).toThrow(
+      'unsupported open-kritt-workflow version "2"'
     );
     expect(() => workflowPayloadFromImport([])).toThrow('JSON root must be an object');
-    expect(() =>
-      workflowPayloadFromImport({
-        name: 'Unsafe extra',
-        extra: ['__proto__'],
-        levels: [
-          {
-            depth: 0,
-            multiOutput: false,
-            outputFormat: terminalFormat,
-            steps: [{ name: 'Analyze', content: 'Analyze {{repo_full}}.' }],
-          },
-        ],
-      })
-    ).toThrow('workflow.extra[0] must be an identifier');
-  });
-
-  it('round-trips stable one-to-one bindings in version 2 files', () => {
-    const exported = createWorkflowExport({
-      name: 'Bound review',
-      steps: [
-        {
-          id: '10',
-          name: 'Source A',
-          depth: 0,
-          multiOutput: true,
-          consumesAll: false,
-          content: 'Find A in {{repo_full}}.',
-          outputFormat: { candidate: 'string' },
-        },
-        {
-          id: '11',
-          name: 'Source B',
-          depth: 0,
-          multiOutput: true,
-          consumesAll: false,
-          content: 'Find B in {{repo_full}}.',
-          outputFormat: { candidate: 'string' },
-        },
-        {
-          id: '20',
-          boundSourceStepId: '10',
-          name: 'Review A',
-          depth: 1,
-          multiOutput: true,
-          consumesAll: false,
-          content: 'Review {{candidate}}.',
-          outputFormat: terminalFormat,
-        },
-        {
-          id: '21',
-          boundSourceStepId: '11',
-          name: 'Review B',
-          depth: 1,
-          multiOutput: true,
-          consumesAll: false,
-          content: 'Review {{candidate}}.',
-          outputFormat: terminalFormat,
-        },
-      ],
-    });
-
-    expect(exported.workflow.levels[1]).toMatchObject({
-      bindPrevious: true,
-      steps: [
-        { clientId: 'step-3', boundSourceStepId: 'step-1' },
-        { clientId: 'step-4', boundSourceStepId: 'step-2' },
-      ],
-    });
-    expect(workflowPayloadFromImport(exported)).toEqual(exported.workflow);
-  });
-
-  it('rejects invalid binding maps before sending an imported workflow to the API', () => {
-    const invalid = {
-      kind: 'open-kritt-workflow',
-      version: 2,
-      workflow: {
-        name: 'Invalid bind',
-        levels: [
-          {
-            depth: 0,
-            multiOutput: true,
-            outputFormat: { candidate: 'string' },
-            steps: [
-              { clientId: 'a', content: 'A' },
-              { clientId: 'b', content: 'B' },
-            ],
-          },
-          {
-            depth: 1,
-            multiOutput: true,
-            bindPrevious: true,
-            outputFormat: terminalFormat,
-            steps: [
-              { clientId: 'c', boundSourceStepId: 'a', content: 'C' },
-              { clientId: 'd', boundSourceStepId: 'a', content: 'D' },
-            ],
-          },
-        ],
-      },
-    };
-
-    expect(() => workflowPayloadFromImport(invalid)).toThrow('used more than once');
-  });
-
-  it('rejects a one-step bind transition', () => {
-    const invalid = {
-      kind: 'open-kritt-workflow',
-      version: 2,
-      workflow: {
-        name: 'Single pair bind',
-        levels: [
-          {
-            depth: 0,
-            multiOutput: true,
-            outputFormat: { candidate: 'string' },
-            steps: [{ clientId: 'a', content: 'A' }],
-          },
-          {
-            depth: 1,
-            multiOutput: true,
-            bindPrevious: true,
-            outputFormat: terminalFormat,
-            steps: [{ clientId: 'b', boundSourceStepId: 'a', content: 'B' }],
-          },
-        ],
-      },
-    };
-
-    expect(() => workflowPayloadFromImport(invalid)).toThrow('at least two steps');
   });
 
   it('creates safe, recognizable export filenames', () => {

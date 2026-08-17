@@ -26,15 +26,12 @@ model Step {
   multiOutput  Boolean  @map("multi_output")
   // When true, depth runs one agent over the whole previous-depth output array.
   consumesAll  Boolean  @default(false) @map("consume_all_previous")
-  // Optional one-to-one route from an adjacent previous-depth sibling.
-  boundSourceStepId BigInt? @map("bound_source_step_id")
   isLastStep   Boolean  @map("is_last_step")
   outputTable  String   @default("workflows.step_results") @map("output_table")
   insertedAt   DateTime @default(now()) @map("inserted_at") @db.Timestamptz(6)
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("steps")
-  @@index([boundSourceStepId], map: "steps_bound_source_step_id_idx")
   @@schema("public")
 }
 
@@ -130,10 +127,8 @@ model Workflow {
   stepIds     BigInt[] @default([]) @map("step_ids")
   name        String
   description String?
-  // Extra scan-input keys declared by or referenced across this workflow.
+  // Distinct {{extra.<key>}} sub-keys referenced across this workflow's steps.
   extra       String[] @default([])
-  includeContextFiles Boolean  @default(false) @map("include_context_files")
-  dedupeStep3 Boolean @default(false) @map("dedupe_step_3")
   insertedAt  DateTime @default(now()) @map("inserted_at") @db.Timestamptz(6)
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
@@ -160,9 +155,6 @@ model Scan {
   modelProvider String  @default("openrouter") @map("model_provider") // codex, claude, openrouter
   harness       String
   thinkingEffort String? @map("thinking_effort") // default, low, medium, high, xhigh, max, ultra
-  // Optional depth-keyed model tuples. The top-level tuple remains the fallback
-  // and is also used for post-processing.
-  modelOverrides Json   @default("{}") @map("model_overrides")
   status        String // queued, pending, prewarming_cache, running, rate_limited, paused, post_processing, completed, stopped, failed
   config        Json // legacy compatibility JSON; scan columns are authoritative
   scopes        Json // must include: files, lines
@@ -291,7 +283,6 @@ model StepMetadata {
   promptTemplate            String?   @map("prompt_template")
   promptFilled              String?   @map("prompt_filled")
   outputJson                Json?     @map("output_json")
-  duplicateOfPrevId         BigInt?   @map("duplicate_of_prev_id")
   checkedOutCommit          String?   @map("checked_out_commit")
   runStartedAt              DateTime? @map("run_started_at") @db.Timestamptz(6)
   runTimeMs                 Decimal?  @map("run_time_ms")

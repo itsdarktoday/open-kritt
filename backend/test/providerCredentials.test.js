@@ -7,13 +7,25 @@ import { test } from 'node:test';
 import { buildAccountsOverview } from '../src/lib/accounts.js';
 import { parseEnvironmentText } from '../src/lib/environmentFile.js';
 import {
+  customProviderDefinition,
   providerCredentialStatuses,
   readManagedCredentialStateSync,
   readManagedCredentialsSync,
   removeManagedProviderCredential,
   saveManagedProviderCredential,
+  saveCustomProvider,
   validateProviderCredential,
 } from '../src/lib/providerCredentials.js';
+
+const NO_LOCAL_LOGIN = {
+  codex: {
+    primaryHome: '/definitely/missing/codex-primary',
+    accountsRoot: '/definitely/missing/codex-accounts',
+    runtimeConfigPath: '/definitely/missing/engine-runtime.env',
+    initialHome: '',
+  },
+  claude: { home: '/definitely/missing/claude' },
+};
 
 async function temporaryCredentialPath(t) {
   const directory = await mkdtemp(join(tmpdir(), 'open-kritt-provider-credentials-'));
@@ -38,7 +50,7 @@ test('managed credentials are saved privately without appearing in status', asyn
     OPENROUTER_API_KEY: 'openrouter-secret',
   });
 
-  const [codex, claude, openrouter] = providerCredentialStatuses({ env: {}, credentialsPath });
+  const [codex, claude, openrouter] = providerCredentialStatuses({ env: {}, credentialsPath, loginOptions: NO_LOCAL_LOGIN });
   assert.equal(codex.configured, false);
   assert.equal(claude.configured, false);
   assert.equal(openrouter.source, 'managed_api_key');
@@ -70,7 +82,7 @@ test('failed .env persistence rolls back the managed provider store', async (t) 
       credentialsPath,
       environmentFilePath: join(invalidParent, '.env'),
     }),
-    { code: 'ENOTDIR' }
+    { code: 'EEXIST' }
   );
 
   assert.deepEqual(readManagedCredentialsSync(credentialsPath), {});
@@ -90,8 +102,9 @@ test('removing an environment-bootstrapped key keeps it removed until explicitly
   openrouter = providerCredentialStatuses(options).find((provider) => provider.id === 'openrouter');
   assert.equal(openrouter.configured, false);
   assert.deepEqual(readManagedCredentialStateSync(credentialsPath), {
-    version: 1,
+    version: 2,
     credentials: {},
+    customProviders: [],
     disabledEnvironmentProviders: ['openrouter'],
   });
 
@@ -108,6 +121,24 @@ test('credential validation accepts only a single-line OpenRouter key', () => {
   assert.equal(validateProviderCredential('claude', 'key').field, 'provider');
   assert.equal(validateProviderCredential('openrouter', ' ').field, 'credential');
   assert.equal(validateProviderCredential('openrouter', 'one\ntwo').field, 'credential');
+});
+
+test('custom providers default to the OpenAI-compatible harness', async (t) => {
+  const credentialsPath = await temporaryCredentialPath(t);
+  const saved = await saveCustomProvider(
+    {
+      name: 'My Gateway',
+      baseUrl: 'https://provider.example/v1/',
+      apiKey: 'secret-key',
+      model: 'gateway-model',
+      organization: 'org_123',
+      extraHeaders: { 'X-Test': 'yes' },
+    },
+    { credentialsPath }
+  );
+
+  assert.deepEqual(saved.harnesses, ['openai-compatible']);
+  assert.deepEqual(customProviderDefinition(saved.id, credentialsPath)?.harnesses, ['openai-compatible']);
 });
 
 test('provider status recognizes Codex and Claude login homes', async (t) => {
@@ -156,36 +187,11 @@ test('Codex homes left on disk but removed from the runtime registry stay inacti
   assert.equal(codex.configured, false);
 });
 
-test('provider status recognizes managed Claude homes in the runtime registry', async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), 'open-kritt-provider-claude-accounts-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const accountsRoot = join(directory, 'claude-accounts');
-  const accountHome = join(accountsRoot, 'reviewer', '.claude');
-  const runtimeConfigPath = join(directory, 'engine-runtime.env');
-  await mkdir(accountHome, { recursive: true });
-  await writeFile(join(accountHome, '.credentials.json'), '{"claudeAiOauth":{"accessToken":"x"}}');
-  await writeFile(runtimeConfigPath, 'ENGINE_CLAUDE_HOME=/claude-accounts/reviewer/.claude\n');
-
-  const claude = providerCredentialStatuses({
-    env: {},
-    credentialsPath: join(directory, 'missing.json'),
-    loginOptions: {
-      claude: {
-        home: join(directory, 'unused-primary'),
-        accountsRoot,
-        runtimeConfigPath,
-      },
-    },
-  }).find((provider) => provider.id === 'claude');
-
-  assert.equal(claude.configured, true);
-  assert.equal(claude.source, 'claude_login');
-});
-
 test('account overview merges executor detail without exposing unrecognized fields', () => {
   const statuses = providerCredentialStatuses({
     env: { OPEN_KRITT_OPENROUTER_API_KEY_CONFIGURED: '1' },
     credentialsPath: '/missing/provider-credentials.json',
+    loginOptions: NO_LOCAL_LOGIN,
   });
   const overview = buildAccountsOverview(statuses, {
     providers: [
@@ -210,14 +216,6 @@ test('account overview merges executor detail without exposing unrecognized fiel
               manualResetCredits: {
                 availableCount: 3,
                 applicableAvailableCount: 1,
-                credits: [
-                  {
-                    id: 'credit-id-must-not-leak',
-                    title: 'Full reset',
-                    expiresAt: '2026-08-12T18:07:27Z',
-                    secret: 'credit-secret-must-not-leak',
-                  },
-                ],
                 secret: 'nested-secret-must-not-leak',
               },
             },
@@ -246,7 +244,6 @@ test('account overview merges executor detail without exposing unrecognized fiel
   assert.deepEqual(account.rateLimits.manualResetCredits, {
     availableCount: 3,
     applicableAvailableCount: 1,
-    credits: [{ title: 'Full reset', expiresAt: '2026-08-12T18:07:27Z' }],
   });
   assert.deepEqual(account.credit, {
     usage: 25.5,

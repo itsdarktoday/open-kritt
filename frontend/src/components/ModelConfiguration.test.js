@@ -207,6 +207,38 @@ describe('modelConfigurationIsValid', () => {
     expect(customOpenRouterMarkup).toContain('<option value="medium" selected="">medium</option>');
   });
 
+  it('renders detected local CLI sessions as selectable scan accounts', () => {
+    const markup = renderToStaticMarkup(
+      React.createElement(
+        MemoryRouter,
+        { initialEntries: ['/'] },
+        React.createElement(ModelConfiguration, {
+          value: {
+            model_provider: 'codex',
+            model: 'gpt-5-codex',
+            thinking_effort: 'medium',
+            harness: 'codex',
+            provider_account_id: 'primary',
+          },
+          onChange: () => {},
+          providers: ['codex'],
+          catalog,
+          accountProviders: [
+            {
+              id: 'codex',
+              accounts: [{ id: 'primary', email: 'reviewer@example.com', label: 'reviewer', active: true }],
+            },
+          ],
+        })
+      )
+    );
+
+    expect(markup).toContain('<label');
+    expect(markup).toContain('account');
+    expect(markup).toContain('reviewer@example.com - local session');
+    expect(markup).toContain('<option value="primary" selected="">reviewer@example.com - local session</option>');
+  });
+
   it('keeps exact OpenRouter entry available when catalog suggestions are loading', () => {
     const loadingCatalog = configuredModelCatalog({
       providers: [{ provider: 'openrouter', input: 'text', status: 'loading', models: [] }],

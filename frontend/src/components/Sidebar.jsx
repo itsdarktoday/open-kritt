@@ -41,40 +41,7 @@ function NavItem({ label, to, active }) {
 
 const GROUP_LABEL = { fontSize: 10, letterSpacing: '0.09em', color: 'var(--text-3)' };
 
-export const COMMUNITY_LINKS = [
-  { label: 'GitHub', href: 'https://github.com/Kritt-ai/open-kritt' },
-  { label: 'X / Twitter', href: 'https://x.com/Kritt_AI' },
-  { label: 'Website', href: 'https://kritt.ai/' },
-  { label: 'Discord', href: 'https://discord.gg/JJr2CbBjc' },
-  { label: 'Contact us', href: 'mailto:info@kritt.ai', external: false },
-];
-
-export function CommunityLinks() {
-  return (
-    <nav className="sidebar-community-links" aria-label="Project and community links">
-      {COMMUNITY_LINKS.map(({ label, href, external = true }) => (
-        <a
-          className="sidebar-community-link"
-          href={href}
-          key={href}
-          {...(external ? { target: '_blank', rel: 'noreferrer' } : {})}
-        >
-          {label}
-        </a>
-      ))}
-    </nav>
-  );
-}
-
-export function CommunityShareButton({ onClick }) {
-  return (
-    <button type="button" className="sidebar-community-share" onClick={onClick}>
-      Support open·kritt
-    </button>
-  );
-}
-
-export default function Sidebar({ onShareCommunity }) {
+export default function Sidebar() {
   const { pathname } = useLocation();
   const { theme, toggle } = useTheme();
 
@@ -153,20 +120,14 @@ export default function Sidebar({ onShareCommunity }) {
       </div>
       <div className="sidebar-nav-group" style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
         <NavItem label="Accounts" to="/accounts" active={isActive('/accounts')} />
+        <NavItem label="Custom providers" to="/custom-providers" active={isActive('/custom-providers')} />
         <NavItem label="Settings" to="/settings" active={isActive('/settings')} />
       </div>
 
-      <div className="sidebar-community">
-        <div className="mono sidebar-community-label" style={GROUP_LABEL}>
-          COMMUNITY
-        </div>
-        <div className="sidebar-community-actions">
-          <CommunityLinks />
-          <CommunityShareButton onClick={onShareCommunity} />
-        </div>
-      </div>
-
-      <div className="sidebar-footer" style={{ paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+      <div
+        className="sidebar-footer"
+        style={{ marginTop: 'auto', paddingTop: 12, borderTop: '1px solid var(--border)' }}
+      >
         <button
           className="sidebar-theme-toggle"
           type="button"

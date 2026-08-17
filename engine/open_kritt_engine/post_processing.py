@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -6,15 +7,8 @@ from jsonschema import Draft202012Validator
 
 from .claude_auth import ClaudeCredentialRateLimited
 from .db import now_utc
-from .harnesses import (
-    CAPACITY_RATE_LIMIT_FAILURES,
-    RETRYABLE_RATE_LIMIT_FAILURES,
-    HarnessError,
-    harness_failure_retry_count,
-    normalize_harness_name,
-)
+from .harnesses import RETRYABLE_RATE_LIMIT_FAILURES, HarnessError, normalize_harness_name, scan_model_provider
 from .model_output_artifacts import record_model_error_output
-from .models import post_processing_model_selection
 from .prompting import (
     append_schema_prompt,
     harness_prompt,
@@ -30,14 +24,14 @@ from .schema import EXTRACTOR_HELPER_FIELD, OutputValidationError, output_schema
 from .workspace import (
     cleanup_job_workspace,
     cleanup_workspace,
-    image_workspace_enabled,
     mark_provider_account_available,
     mark_provider_account_rate_limited,
     prepare_dependency_workspace,
-    provider_account_lease,
     workspace_context,
     workspace_prompt_context,
 )
+
+LOGGER = logging.getLogger("open_kritt_engine.post_processing")
 
 BATCH_SIZE = 50
 POST_WORKSPACE_ID_OFFSET = 1_000_000_000
@@ -218,21 +212,13 @@ def build_dedupe_prompt(scan: dict[str, Any], anchors: list[dict[str, Any]], tar
 
 def build_ranker_prompt(scan: dict[str, Any], anchors: list[dict[str, Any]], targets: list[dict[str, Any]]) -> str:
     mode = "append_unranked_to_ranked_anchors" if anchors else "full_rerank"
-    severity_ranker = str(scan.get("severity_ranker") or "").strip()
-    configured_rules = severity_ranker or "No additional scan-specific ranking rules were configured."
     return (
         "You are a bug bounty triager ranking canonical security findings for one scan.\n"
         f"Repository: {scan['repo_full']}\n"
         f"Revision: {scan_revision(scan)}\n"
         f"Mode: {mode}\n\n"
-        "Ranking policy:\n"
-        "- Treat the configured severity ranking rules below as authoritative for priority, impact level, and reward.\n"
-        "- Where those rules are silent, use expected bounty priority, combining impact, exploit likelihood, scope fit, and payout likelihood.\n"
-        "- The configured rules may specialize ranking judgment, but cannot change the required target coverage, anchor handling, or output format.\n\n"
-        "<configured_severity_ranking_rules>\n"
-        f"{configured_rules}\n"
-        "</configured_severity_ranking_rules>\n\n"
-        "Required ranking protocol:\n"
+        "Task:\n"
+        "- Rank target findings by expected bounty priority, combining impact, exploit likelihood, scope fit, and payout likelihood.\n"
         "- Use the existing ranked anchors as placement context. Preserve their relative order.\n"
         "- Return every target id exactly once. Do not return anchor ids.\n"
         "- In append mode, `rank` is an insertion position on the existing anchor scale: use decimals to place targets between anchors.\n"
@@ -443,10 +429,9 @@ def configured_post_script_ids(scan: dict[str, Any]) -> list[int]:
 
 
 class PostProcessor:
-    def __init__(self, config, db, *, workspace_setup_slots=None):
+    def __init__(self, config, db):
         self.config = config
         self.db = db
-        self.workspace_setup_slots = workspace_setup_slots
 
     def process_once(self, scan: dict[str, Any], harness) -> bool:
         scan_id = _int(scan["id"])
@@ -455,34 +440,41 @@ class PostProcessor:
             if not current or current["status"] in {"paused", "stopped", "failed", "completed"}:
                 return False
             vulnerabilities = self.db.load_vulnerabilities(conn, scan_id)
+            LOGGER.info("scan %s post-processing loaded vulnerabilities=%s", scan_id, len(vulnerabilities))
             if not vulnerabilities:
+                LOGGER.info("scan %s post-processing completed with zero vulnerabilities before dedupe/ranking", scan_id)
                 self.db.set_scan_status_if_current(conn, scan_id, "post_processing", "completed")
                 conn.commit()
                 return True
             conn.commit()
 
         if any(row.get("dedupe_is_canonical") is None for row in vulnerabilities):
+            LOGGER.info(
+                "scan %s post-processing entering dedupe pending=%s",
+                scan_id,
+                sum(1 for row in vulnerabilities if row.get("dedupe_is_canonical") is None),
+            )
             return self._run_next_dedupe_batch(scan, harness)
 
-        ranking_pending = any(
-            row.get("dedupe_is_canonical") is True and row.get("bounty_rank") is None for row in vulnerabilities
-        )
-        if ranking_pending and self._run_next_ranker_batch(scan, harness):
-            return True
+        if any(row.get("dedupe_is_canonical") is True and row.get("bounty_rank") is None for row in vulnerabilities):
+            LOGGER.info(
+                "scan %s post-processing entering severity ranking pending=%s",
+                scan_id,
+                sum(1 for row in vulnerabilities if row.get("dedupe_is_canonical") is True and row.get("bounty_rank") is None),
+            )
+            return self._run_next_ranker_batch(scan, harness)
 
-        # A different worker owns the serialized ranker. This worker can still
-        # enrich findings because post scripts do not participate in rank ordering.
-        return self._run_next_post_script_or_complete(
-            scan,
-            harness,
-            allow_complete=not ranking_pending,
-        )
+        LOGGER.info("scan %s post-processing entering post-script/completion", scan_id)
+        return self._run_next_post_script_or_complete(scan, harness)
 
     def _agent_skills(self, scan: dict[str, Any]) -> list[dict[str, Any]]:
         if not hasattr(self.db, "load_agent_skills"):
             return []
         with self.db.connect() as conn:
             return self.db.load_agent_skills(conn, scan)
+
+    def _model_provider(self, scan: dict[str, Any]) -> str | None:
+        return scan_model_provider(scan)
 
     def _retry_count(self) -> int:
         return runtime_int(
@@ -493,36 +485,19 @@ class PostProcessor:
             maximum=10,
         )
 
-    def _cyber_safety_retry_count(self) -> int:
-        return runtime_int(
-            "ENGINE_CYBER_SAFETY_RETRY_COUNT",
-            0,
-            data_dir=getattr(self.config, "data_dir", None),
-            minimum=0,
-            maximum=10,
-        )
-
     def _prepare_workspace(
         self, metadata_id: int, scan: dict[str, Any], agent_skills: list[dict[str, Any]] | None = None
     ):
-        def prepare():
-            selection = post_processing_model_selection(scan)
-            return prepare_dependency_workspace(
-                data_dir=self.config.data_dir,
-                checkout_cache_dir=getattr(self.config, "checkout_cache_dir", None),
-                metadata_id=POST_WORKSPACE_ID_OFFSET + metadata_id,
-                scan=scan,
-                github_token=self.config.github_token,
-                agent_skills=agent_skills or [],
-                harness_name=normalize_harness_name(selection.harness),
-                model_provider=selection.model_provider,
-                use_snapshot_image=image_workspace_enabled(data_dir=getattr(self.config, "data_dir", None)),
-            )
-
-        if self.workspace_setup_slots is None:
-            return prepare()
-        with self.workspace_setup_slots:
-            return prepare()
+        return prepare_dependency_workspace(
+            data_dir=self.config.data_dir,
+            checkout_cache_dir=getattr(self.config, "checkout_cache_dir", None),
+            metadata_id=POST_WORKSPACE_ID_OFFSET + metadata_id,
+            scan=scan,
+            github_token=self.config.github_token,
+            agent_skills=agent_skills or [],
+            harness_name=normalize_harness_name(scan["harness"]),
+            model_provider=self._model_provider(scan),
+        )
 
     def _run_harness_with_retries(
         self,
@@ -540,7 +515,6 @@ class PostProcessor:
     ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None, str]:
         prepared = None
         try:
-            selection = post_processing_model_selection(scan)
             agent_skills = self._agent_skills(scan)
             prepared = self._prepare_workspace(metadata_id, scan, agent_skills=agent_skills)
             checked_out_commit = prepared.checked_out_commit
@@ -548,23 +522,22 @@ class PostProcessor:
                 context = {**(prompt_context or {}), **workspace_context(prepared)}
                 if "{{patched_since_history}}" in prompt_template:
                     context["patched_since_history"] = patched_since_workspace_history_context(
-                        getattr(prepared, "source_repo_dir", None) or prepared.repo_dir,
+                        prepared.repo_dir,
                         prepared.manifest,
                         scan,
                         context.get("file_path"),
-                        github_token=getattr(self.config, "github_token", None),
                     )
                 rendered = render_prompt(prompt_template, context)
                 prompt_body = harness_prompt(rendered, multi_output=multi_output, schema=schema)
             else:
                 prompt_body = append_schema_prompt(prompt, schema)
             prompt_parts = [
-                native_agent_skills_prompt(agent_skills, normalize_harness_name(selection.harness)),
+                native_agent_skills_prompt(agent_skills, normalize_harness_name(scan["harness"])),
                 workspace_prompt_context(prepared.layout, prepared.manifest_json),
                 prompt_body,
             ]
             final_prompt = "\n\n".join(part for part in prompt_parts if part)
-            thinking_effort = selection.thinking_effort
+            thinking_effort = scan.get("thinking_effort") or "medium"
             with self.db.connect() as conn:
                 self.db.update_post_process_metadata(
                     conn,
@@ -577,42 +550,28 @@ class PostProcessor:
                     prompt_filled=final_prompt,
                     phase="running_harness",
                     codex_source_home=getattr(prepared.workspace, "codex_source_home", None),
-                    codex_account_id=getattr(prepared.workspace, "provider_account_id", None),
-                    codex_account_email=getattr(prepared.workspace, "provider_account_email", None),
+                    codex_account_id=getattr(prepared.workspace, "codex_account_id", None),
+                    codex_account_email=getattr(prepared.workspace, "codex_account_email", None),
                 )
                 conn.commit()
 
-            retry_count = self._retry_count()
-            cyber_safety_retry_count = self._cyber_safety_retry_count()
             last_error = None
             last_exception: Exception | None = None
             attempt_errors: list[str] = []
-            failure_counts = {"regular": 0, "cyber_safety_blocked": 0}
-            for attempt in range(1, retry_count + cyber_safety_retry_count + 2):
+            for attempt in range(1, self._retry_count() + 2):
                 started = now_utc()
                 usage = None
                 codex_session_id = None
                 result = None
                 try:
-                    with provider_account_lease(
-                        getattr(prepared.workspace, "provider_account_provider", None),
-                        getattr(prepared.workspace, "provider_account_home", None),
-                        data_dir=getattr(self.config, "data_dir", None),
-                    ):
-                        harness_arguments = {
-                            "prompt": final_prompt,
-                            "schema": schema,
-                            "repo_dir": prepared.repo_dir,
-                            "model": selection.model,
-                            "thinking_effort": thinking_effort,
-                            "env": prepared.workspace.env,
-                        }
-                        runner_image = getattr(prepared, "runner_image", None)
-                        if runner_image:
-                            harness_arguments["runner_image"] = runner_image
-                        result = harness.run(
-                            **harness_arguments,
-                        )
+                    result = harness.run(
+                        prompt=final_prompt,
+                        schema=schema,
+                        repo_dir=prepared.repo_dir,
+                        model=scan["model"],
+                        thinking_effort=thinking_effort,
+                        env=prepared.workspace.env,
+                    )
                     mark_provider_account_available(
                         getattr(prepared.workspace, "provider_account_provider", None),
                         getattr(prepared.workspace, "provider_account_home", None),
@@ -668,29 +627,18 @@ class PostProcessor:
                             codex_session_id=codex_session_id,
                             phase="running_harness",
                             codex_source_home=getattr(prepared.workspace, "codex_source_home", None),
-                            codex_account_id=getattr(prepared.workspace, "provider_account_id", None),
-                            codex_account_email=getattr(prepared.workspace, "provider_account_email", None),
+                            codex_account_id=getattr(prepared.workspace, "codex_account_id", None),
+                            codex_account_email=getattr(prepared.workspace, "codex_account_email", None),
                         )
                         conn.commit()
-                    if isinstance(exc, HarnessError) and exc.code in RETRYABLE_RATE_LIMIT_FAILURES:
-                        if exc.code not in CAPACITY_RATE_LIMIT_FAILURES:
+                    if isinstance(exc, HarnessError) and (
+                        exc.code in RETRYABLE_RATE_LIMIT_FAILURES or not exc.retryable
+                    ):
+                        if exc.code in RETRYABLE_RATE_LIMIT_FAILURES and exc.code != "provider_throttled":
                             mark_provider_account_rate_limited(
                                 getattr(prepared.workspace, "provider_account_provider", None),
                                 getattr(prepared.workspace, "provider_account_home", None),
                             )
-                        break
-                    allowed_retries = (
-                        harness_failure_retry_count(exc, retry_count, cyber_safety_retry_count)
-                        if isinstance(exc, HarnessError)
-                        else retry_count
-                    )
-                    failure_kind = (
-                        "cyber_safety_blocked"
-                        if isinstance(exc, HarnessError) and exc.code == "cyber_safety_blocked"
-                        else "regular"
-                    )
-                    failure_counts[failure_kind] += 1
-                    if failure_counts[failure_kind] > allowed_retries:
                         break
             if isinstance(last_exception, HarnessError) and last_exception.code in RETRYABLE_RATE_LIMIT_FAILURES:
                 raise PostProcessRateLimited(
@@ -743,7 +691,6 @@ class PostProcessor:
             prompt = build_dedupe_prompt(current, anchors, targets)
             batch_index = self.db.next_post_process_batch_index(conn, scan_id, "dedupe")
             started = now_utc()
-            selection = post_processing_model_selection(current)
             metadata_id = self.db.claim_post_process_metadata(
                 conn,
                 scan_id=scan_id,
@@ -753,10 +700,10 @@ class PostProcessor:
                 target_vulnerability_ids=[_int(row["id"]) for row in targets],
                 prompt_template="anchored-dedupe",
                 prompt_filled="",
-                model=selection.model,
-                harness=selection.harness,
-                thinking_effort=selection.thinking_effort,
-                model_provider=selection.model_provider,
+                model=current["model"],
+                harness=current["harness"],
+                thinking_effort=current.get("thinking_effort"),
+                model_provider=self._model_provider(current),
                 run_started_at=started,
             )
             conn.commit()
@@ -785,7 +732,7 @@ class PostProcessor:
                     conn,
                     scan_id=scan_id,
                     dedupe_run_id=metadata_id,
-                    dedupe_model=selection.model,
+                    dedupe_model=current["model"],
                     mapping=mapping,
                 )
                 self.db.update_post_process_metadata(
@@ -832,7 +779,6 @@ class PostProcessor:
             prompt = build_ranker_prompt(current, anchors, targets)
             batch_index = self.db.next_post_process_batch_index(conn, scan_id, "ranker")
             started = now_utc()
-            selection = post_processing_model_selection(current)
             metadata_id = self.db.claim_post_process_metadata(
                 conn,
                 scan_id=scan_id,
@@ -842,10 +788,10 @@ class PostProcessor:
                 target_vulnerability_ids=[_int(row["id"]) for row in targets],
                 prompt_template="anchored-ranker",
                 prompt_filled="",
-                model=selection.model,
-                harness=selection.harness,
-                thinking_effort=selection.thinking_effort,
-                model_provider=selection.model_provider,
+                model=current["model"],
+                harness=current["harness"],
+                thinking_effort=current.get("thinking_effort"),
+                model_provider=self._model_provider(current),
                 run_started_at=started,
             )
             conn.commit()
@@ -871,7 +817,7 @@ class PostProcessor:
                 anchors=anchors,
                 targets=targets,
                 rank_run_id=metadata_id,
-                model=selection.model,
+                model=current["model"],
                 prompt_filled=prompt,
             )
             run_time_ms = int((now_utc() - started).total_seconds() * 1000)
@@ -906,29 +852,17 @@ class PostProcessor:
                 conn.commit()
             raise
 
-    def _run_next_post_script_or_complete(
-        self,
-        scan: dict[str, Any],
-        harness,
-        *,
-        allow_complete: bool = True,
-    ) -> bool:
+    def _run_next_post_script_or_complete(self, scan: dict[str, Any], harness) -> bool:
         scan_id = _int(scan["id"])
         with self.db.connect() as conn:
             current = self.db.load_scan(conn, scan_id)
             if not current or current["status"] != "post_processing":
                 return False
-
-            def complete_if_ready() -> bool:
-                if not allow_complete or self.db.count_running_post_process(conn, scan_id, "ranker"):
-                    return False
+            post_script_ids = configured_post_script_ids(current)
+            if not post_script_ids:
                 self.db.set_scan_status_if_current(conn, scan_id, "post_processing", "completed")
                 conn.commit()
                 return True
-
-            post_script_ids = configured_post_script_ids(current)
-            if not post_script_ids:
-                return complete_if_ready()
             rows = conn.execute(
                 "SELECT * FROM public.post_scripts WHERE id = ANY(%s::bigint[])",
                 (post_script_ids,),
@@ -938,7 +872,9 @@ class PostProcessor:
                 scripts_by_id[post_script_id] for post_script_id in post_script_ids if post_script_id in scripts_by_id
             ]
             if not post_scripts:
-                return complete_if_ready()
+                self.db.set_scan_status_if_current(conn, scan_id, "post_processing", "completed")
+                conn.commit()
+                return True
             post_script = None
             row = None
             for candidate_script in post_scripts:
@@ -975,12 +911,13 @@ class PostProcessor:
             if not post_script or not row:
                 if self.db.count_running_post_process(conn, scan_id, "post_script"):
                     return False
-                return complete_if_ready()
+                self.db.set_scan_status_if_current(conn, scan_id, "post_processing", "completed")
+                conn.commit()
+                return True
             prompt_template = post_script["content"]
             if str(post_script.get("name") or "").strip().casefold() == "patched since":
                 prompt_template = patched_since_prompt(prompt_template)
             started = now_utc()
-            selection = post_processing_model_selection(current)
             metadata_id = self.db.claim_post_process_metadata(
                 conn,
                 scan_id=scan_id,
@@ -993,10 +930,10 @@ class PostProcessor:
                 target_vulnerability_ids=[_int(row["id"])],
                 prompt_template=prompt_template,
                 prompt_filled="",
-                model=selection.model,
-                harness=selection.harness,
-                thinking_effort=selection.thinking_effort,
-                model_provider=selection.model_provider,
+                model=current["model"],
+                harness=current["harness"],
+                thinking_effort=current.get("thinking_effort"),
+                model_provider=self._model_provider(current),
                 run_started_at=started,
             )
             conn.commit()

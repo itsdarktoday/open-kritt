@@ -36,13 +36,11 @@ const BASE = resolveApiBase(
 );
 
 export class ApiError extends Error {
-  constructor(message, status, errors, data = null) {
+  constructor(message, status, errors) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.errors = errors || [];
-    this.code = data?.code || null;
-    this.data = data;
   }
 }
 
@@ -75,55 +73,9 @@ async function request(path, options = {}) {
     /* no body */
   }
   if (!res.ok) {
-    throw new ApiError(data?.error || `Request failed (${res.status})`, res.status, data?.errors, data);
-  }
-  return data;
-}
-
-function safeAttachmentFilename(value, fallback) {
-  const filename = [...`${value || ''}`]
-    .filter((character) => {
-      const code = character.charCodeAt(0);
-      return code > 31 && code !== 127;
-    })
-    .join('')
-    .split(/[\\/]/)
-    .pop()
-    .trim();
-  return filename || fallback;
-}
-
-export function attachmentFilename(contentDisposition, fallback = 'download.zip') {
-  const header = `${contentDisposition || ''}`;
-  const encoded = header.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
-  if (encoded) {
-    try {
-      return safeAttachmentFilename(decodeURIComponent(encoded.trim()), fallback);
-    } catch {
-      // Fall through to the plain filename parameter.
-    }
-  }
-  const quoted = header.match(/filename\s*=\s*"((?:[^"\\]|\\.)*)"/i)?.[1];
-  if (quoted) return safeAttachmentFilename(quoted.replace(/\\(["\\])/g, '$1'), fallback);
-  const plain = header.match(/filename\s*=\s*([^;]+)/i)?.[1];
-  return safeAttachmentFilename(plain?.trim(), fallback);
-}
-
-async function download(path, fallbackFilename) {
-  const res = await fetch(`${BASE}/api${path}`, { cache: 'no-store' });
-  if (!res.ok) {
-    let data = null;
-    try {
-      data = await res.json();
-    } catch {
-      /* no JSON error body */
-    }
     throw new ApiError(data?.error || `Request failed (${res.status})`, res.status, data?.errors);
   }
-  return {
-    blob: await res.blob(),
-    filename: attachmentFilename(res.headers.get('Content-Disposition'), fallbackFilename),
-  };
+  return data;
 }
 
 export const api = {
@@ -149,7 +101,6 @@ export const api = {
   },
   scan: (id) => request(`/scans/${id}`),
   scanVulnerabilities: (id) => request(`/scans/${id}/vulnerabilities`),
-  exportScanFindings: (id) => download(`/scans/${id}/export`, `scan-${id}-findings.zip`),
   createScan: (body) => request('/scans', { method: 'POST', body }),
   updateScan: (id, body) => request(`/scans/${id}`, { method: 'PATCH', body }),
   // model providers currently configured for the engine
@@ -157,12 +108,17 @@ export const api = {
   // configured providers and their selectable model catalogs
   modelCatalog: () => request('/model-catalog'),
   // provider accounts, provider login sessions, and the managed OpenRouter key
-  accounts: (refresh = false) => request(`/accounts${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }),
-  accountSummary: () => request('/accounts/summary', { cache: 'no-store' }),
+  accounts: (refresh = false) => request(`/accounts${refresh ? '?refresh=1' : ''}`),
+  accountSummary: () => request('/accounts/summary'),
   accountProvider: (provider, refresh = false) =>
-    request(`/accounts/provider/${encodeURIComponent(provider)}${refresh ? '?refresh=1' : ''}`, {
-      cache: 'no-store',
-    }),
+    request(`/accounts/provider/${encodeURIComponent(provider)}${refresh ? '?refresh=1' : ''}`),
+  customProviders: () => request('/accounts/custom-providers'),
+  createCustomProvider: (body) => request('/accounts/custom-providers', { method: 'POST', body }),
+  updateCustomProvider: (providerId, body) =>
+    request(`/accounts/custom-providers/${encodeURIComponent(providerId)}`, { method: 'PUT', body }),
+  testCustomProvider: (providerId) =>
+    request(`/accounts/custom-providers/${encodeURIComponent(providerId)}/test`, { method: 'POST' }),
+  deleteCustomProvider: (providerId) => request(`/accounts/custom-providers/${encodeURIComponent(providerId)}`, { method: 'DELETE' }),
   saveProviderCredential: (provider, credential) =>
     request(`/accounts/${provider}`, { method: 'POST', body: { credential } }),
   removeProviderCredential: (provider) => request(`/accounts/${provider}`, { method: 'DELETE' }),
@@ -170,6 +126,10 @@ export const api = {
     request(`/accounts/${encodeURIComponent(provider)}/account/${encodeURIComponent(accountId)}`, {
       method: 'DELETE',
     }),
+  saveProviderExecutable: (provider, path) =>
+    request(`/accounts/${encodeURIComponent(provider)}/executable`, { method: 'POST', body: { path } }),
+  refreshProviderSession: (provider) =>
+    request(`/accounts/${encodeURIComponent(provider)}/refresh`, { method: 'POST' }),
   startCodexWeeklyUsage: (accountId) =>
     request(`/accounts/codex/account/${encodeURIComponent(accountId)}/start-weekly`, { method: 'POST' }),
   useCodexManualReset: (accountId) =>
@@ -182,7 +142,7 @@ export const api = {
       method: 'POST',
       ...(accountId ? { body: { accountId } } : {}),
     }),
-  providerLogin: (sessionId) => request(`/accounts/login/${sessionId}`, { cache: 'no-store' }),
+  providerLogin: (sessionId) => request(`/accounts/login/${sessionId}`),
   submitProviderLoginCode: (sessionId, code) =>
     request(`/accounts/login/${sessionId}/input`, { method: 'POST', body: { code } }),
   cancelProviderLogin: (sessionId) => request(`/accounts/login/${sessionId}`, { method: 'DELETE' }),
@@ -197,7 +157,6 @@ export const api = {
   updateVulnerability: (id, body) => request(`/vulnerabilities/${id}`, { method: 'PATCH', body }),
   // local repos available to scan
   localRepos: () => request('/local-repos'),
-  localRepoStats: (name, options) => request(`/local-repos/${encodeURIComponent(name)}/stats`, options),
   // post-scripts
   postScripts: () => request('/post-scripts'),
   postScript: (id) => request(`/post-scripts/${id}`),
